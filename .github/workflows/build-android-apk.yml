@@ -1,0 +1,46 @@
+name: Build EASY CALL Android APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Build Web Bundle
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+            npm run build
+          else
+            echo "Using pre-built dist/ bundle from builder ZIP"
+          fi
+      - name: Sync Capacitor Android & Build APK
+        run: |
+          cd mobile
+          npm init -y
+          npm install @capacitor/core @capacitor/cli @capacitor/android
+          npx cap sync android
+          cd android
+          if [ ! -f gradlew ]; then
+            gradle wrapper
+          fi
+          chmod +x gradlew
+          if [ -f keystore.properties ]; then
+            ./gradlew assembleRelease
+          else
+            ./gradlew assembleDebug
+          fi
+      - name: Upload EASY_CALL_ANDROID.apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: EASY_CALL_ANDROID.apk
+          path: mobile/android/app/build/outputs/apk/**/*.apk

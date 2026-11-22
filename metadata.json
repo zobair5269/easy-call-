@@ -1,0 +1,6 @@
+{
+  "name": "EASY CALL",
+  "description": "One World. One Connection. Free, simple, and secure global audio and video calling for every country, language, and generation.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">EASY CALL</string>
+    <string name="title_activity_main">EASY CALL</string>
+    <string name="package_name">app.easycall.global</string>
+    <string name="custom_url_scheme">easycall</string>
+</resources>
