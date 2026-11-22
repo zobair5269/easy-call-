@@ -390,7 +390,7 @@ export const WelcomeAuth: React.FC<WelcomeAuthProps> = ({
                                 type="url"
                                 value={serverDraft}
                                 onChange={(e) => setServerDraft(e.target.value)}
-                                placeholder="https://your-live-server.run.app"
+                                placeholder="https://easy-call-haib.onrender.com"
                                 className="flex-1 rounded-lg border border-rose-300 dark:border-rose-700 bg-white dark:bg-slate-900 px-2.5 py-1 font-mono text-xs text-slate-900 dark:text-white"
                               />
                               <button

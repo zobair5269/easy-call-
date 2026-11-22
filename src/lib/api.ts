@@ -101,19 +101,38 @@ export async function apiFetch<T>(
   }
 
   const targetUrl = resolveApiUrl(path);
-  let res: Response;
-  try {
-    res = await fetch(targetUrl, {
-      ...options,
-      headers,
-      credentials: 'include',
-    });
-  } catch {
+  let res: Response | null = null;
+  let lastNetworkError = false;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      res = await fetch(targetUrl, {
+        ...options,
+        headers,
+        credentials: 'include',
+      });
+      if (attempt === 0 && (res.status === 502 || res.status === 503 || res.status === 504)) {
+        await new Promise((r) => setTimeout(r, 2500));
+        continue;
+      }
+      lastNetworkError = false;
+      break;
+    } catch {
+      lastNetworkError = true;
+      if (attempt === 0 && isNativeApkOrigin() && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+        await new Promise((r) => setTimeout(r, 2000));
+        continue;
+      }
+      break;
+    }
+  }
+
+  if (lastNetworkError || !res) {
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
       throw new Error('No internet connection on this device.');
     }
     if (isNativeApkOrigin()) {
-      throw new Error('Server is offline or not published yet. Please Share / Deploy in AI Studio first.');
+      throw new Error('Server is waking up or unreachable. Wait 15 seconds and tap again.');
     }
     throw new Error('Unable to reach EASY CALL server. Please try again.');
   }
@@ -127,8 +146,10 @@ export async function apiFetch<T>(
       typeof data?.error === 'string'
         ? data.error
         : res.status === 404 && isNativeApkOrigin()
-          ? 'Server is not published yet (404). Please Share / Deploy in AI Studio first.'
-          : `Request failed (${res.status})`;
+          ? 'Server endpoint not found (404). Please verify Server URL.'
+          : res.status >= 502 && res.status <= 504
+            ? 'Server is starting up. Please wait a few seconds and try again.'
+            : `Request failed (${res.status})`;
     throw new Error(message);
   }
   return data as T;

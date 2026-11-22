@@ -544,7 +544,7 @@ export const AdminBuilderPage: React.FC<{ onBackToApp: () => void }> = ({ onBack
                   />
                   {!urlCheck.checking && urlCheck.reachable === false && (
                     <p className="mt-2 rounded-xl border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/40 px-3.5 py-2 text-xs text-amber-900 dark:text-amber-200">
-                      Server check returned HTTP {urlCheck.status || 'unreachable'}. To allow mobile APK users to register and call from anywhere, click <strong>Deploy / Share</strong> in AI Studio (or enter your deployed public server URL above) and then click <strong>Rebuild EASY_CALL_ANDROID.apk</strong>.
+                      Server check returned HTTP {urlCheck.status || 'unreachable'}. Ensure your public server URL above is running (HTTP 200) and then click <strong>Rebuild EASY_CALL_ANDROID.apk</strong>.
                     </p>
                   )}
                   {!urlCheck.checking && urlCheck.reachable === true && (

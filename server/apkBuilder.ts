@@ -467,6 +467,7 @@ public class MainActivity extends Activity {
                     final boolean allowed =
                         APP_HOST.equalsIgnoreCase(originHost) ||
                         (!SERVER_HOST.isEmpty() && originHost.equalsIgnoreCase(SERVER_HOST)) ||
+                        originHost.endsWith(".onrender.com") ||
                         originHost.endsWith(".run.app");
 
                     runOnUiThread(new Runnable() {
