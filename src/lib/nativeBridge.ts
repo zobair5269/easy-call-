@@ -4,6 +4,7 @@ interface EasyCallNativeApi {
   stopRinging?: () => void;
   setCallAudioMode?: (inCall: boolean, speakerOn: boolean) => void;
   setSpeakerphone?: (speakerOn: boolean) => void;
+  setRingtone?: (ringtoneId: string) => void;
 }
 
 declare global {
@@ -51,6 +52,14 @@ export function setNativeCallAudioMode(inCall: boolean, speakerOn: boolean): voi
 export function setNativeSpeakerphone(speakerOn: boolean): void {
   try {
     window.EasyCallNative?.setSpeakerphone?.(speakerOn);
+  } catch {
+    // Ignore when running outside APK
+  }
+}
+
+export function setNativeRingtone(ringtoneId: string): void {
+  try {
+    window.EasyCallNative?.setRingtone?.(ringtoneId);
   } catch {
     // Ignore when running outside APK
   }

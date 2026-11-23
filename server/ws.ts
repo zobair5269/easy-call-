@@ -2,7 +2,6 @@ import type { IncomingMessage, Server as HttpServer, ServerResponse } from 'node
 import { WebSocketServer, WebSocket } from 'ws';
 import {
   db,
-  areFriends,
   isBlockedBetween,
   getPublicUserView,
   type UserRow,
@@ -97,15 +96,36 @@ function broadcastPresenceToFriends(userId: string, online: boolean) {
     | undefined;
   if (!user || !user.show_online_status) return;
 
+  const peerIds = new Set<string>();
   const friends = db
     .prepare(
-      `SELECT CASE WHEN user_a = ? THEN user_b ELSE user_a END AS friend_id
+      `SELECT CASE WHEN user_a = ? THEN user_b ELSE user_a END AS peer_id
        FROM friendships WHERE user_a = ? OR user_b = ?`
     )
-    .all(userId, userId, userId) as Array<{ friend_id: string }>;
+    .all(userId, userId, userId) as Array<{ peer_id: string }>;
+  for (const row of friends) peerIds.add(row.peer_id);
 
-  for (const row of friends) {
-    sendToUser(row.friend_id, {
+  const recentCallPeers = db
+    .prepare(
+      `SELECT DISTINCT CASE WHEN caller_id = ? THEN callee_id ELSE caller_id END AS peer_id
+       FROM call_records WHERE caller_id = ? OR callee_id = ?
+       LIMIT 100`
+    )
+    .all(userId, userId, userId) as Array<{ peer_id: string }>;
+  for (const row of recentCallPeers) peerIds.add(row.peer_id);
+
+  const recentMsgPeers = db
+    .prepare(
+      `SELECT DISTINCT CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END AS peer_id
+       FROM messages WHERE sender_id = ? OR receiver_id = ?
+       LIMIT 100`
+    )
+    .all(userId, userId, userId) as Array<{ peer_id: string }>;
+  for (const row of recentMsgPeers) peerIds.add(row.peer_id);
+
+  for (const peerId of peerIds) {
+    if (peerId === userId) continue;
+    sendToUser(peerId, {
       type: 'presence:update',
       userId,
       online,
@@ -243,12 +263,25 @@ export function initWebSocketServer(httpServer: HttpServer) {
         const callType = msg.callType === 'video' ? 'video' : 'audio';
 
         if (!targetUserId || targetUserId === userId) return;
-        if (!areFriends(userId, targetUserId) || isBlockedBetween(userId, targetUserId)) {
+        const targetRow = db.prepare('SELECT id FROM users WHERE id = ?').get(targetUserId) as
+          | { id: string }
+          | undefined;
+        if (!targetRow) {
+          ws.send(
+            JSON.stringify({
+              type: 'call:error',
+              code: 'NOT_FOUND',
+              message: 'Contact account not found.',
+            })
+          );
+          return;
+        }
+        if (isBlockedBetween(userId, targetUserId)) {
           ws.send(
             JSON.stringify({
               type: 'call:error',
               code: 'PERMISSION_DENIED',
-              message: 'Calls are only permitted between accepted friends.',
+              message: 'Cannot call this user because a block is active.',
             })
           );
           return;
@@ -441,6 +474,7 @@ export function initWebSocketServer(httpServer: HttpServer) {
         msg.type === 'webrtc:answer' ||
         msg.type === 'webrtc:ice-candidate' ||
         msg.type === 'webrtc:media-state' ||
+        msg.type === 'relay:activate' ||
         msg.type === 'relay:audio' ||
         msg.type === 'relay:video'
       ) {
@@ -455,7 +489,7 @@ export function initWebSocketServer(httpServer: HttpServer) {
           )
           .get(callId, userId, targetUserId, targetUserId, userId);
 
-        if (!call || !areFriends(userId, targetUserId) || isBlockedBetween(userId, targetUserId)) {
+        if (!call || isBlockedBetween(userId, targetUserId)) {
           return;
         }
 
@@ -468,7 +502,7 @@ export function initWebSocketServer(httpServer: HttpServer) {
 
       if (msg.type === 'chat:typing') {
         const targetUserId = typeof msg.targetUserId === 'string' ? msg.targetUserId : '';
-        if (!targetUserId || !areFriends(userId, targetUserId) || isBlockedBetween(userId, targetUserId)) {
+        if (!targetUserId || isBlockedBetween(userId, targetUserId)) {
           return;
         }
         sendToUser(targetUserId, {

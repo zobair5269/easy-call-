@@ -238,6 +238,7 @@ export async function compileDirectAndroidApk(
     const assetsDir = path.join(workDir, 'assets');
     const wwwDir = path.join(assetsDir, 'www');
     const valuesDir = path.join(resDir, 'values');
+    const rawResDir = path.join(resDir, 'raw');
     const mipmapDir = path.join(resDir, 'mipmap-xxxhdpi');
     const mipmapXxhdpiDir = path.join(resDir, 'mipmap-xxhdpi');
     const mipmapXhdpiDir = path.join(resDir, 'mipmap-xhdpi');
@@ -249,6 +250,7 @@ export async function compileDirectAndroidApk(
     const dexDir = path.join(workDir, 'dex');
 
     fs.mkdirSync(valuesDir, { recursive: true });
+    fs.mkdirSync(rawResDir, { recursive: true });
     fs.mkdirSync(mipmapDir, { recursive: true });
     fs.mkdirSync(mipmapXxhdpiDir, { recursive: true });
     fs.mkdirSync(mipmapXhdpiDir, { recursive: true });
@@ -259,7 +261,7 @@ export async function compileDirectAndroidApk(
     fs.mkdirSync(classesDir, { recursive: true });
     fs.mkdirSync(dexDir, { recursive: true });
 
-    // 1. Copy official Easy Call logo into all mipmap densities
+    // 1. Copy official Easy Call logo into all mipmap densities & custom ringtone into res/raw
     const icon512 = path.join(rootDir, 'public', 'pwa-512x512.png');
     const icon192 = path.join(rootDir, 'public', 'pwa-192x192.png');
     const hiResIcon = fs.existsSync(icon512) ? icon512 : icon192;
@@ -271,6 +273,23 @@ export async function compileDirectAndroidApk(
     if (fs.existsSync(medResIcon)) {
       fs.copyFileSync(medResIcon, path.join(mipmapXhdpiDir, 'ic_launcher.png'));
       fs.copyFileSync(medResIcon, path.join(mipmapHdpiDir, 'ic_launcher.png'));
+    }
+    const customRingtoneWav = path.join(rootDir, 'public', 'easycall-ringtone.wav');
+    if (fs.existsSync(customRingtoneWav)) {
+      fs.copyFileSync(customRingtoneWav, path.join(rawResDir, 'easycall_ringtone.wav'));
+    }
+    const ringtoneVariants = [
+      'imo_velvet',
+      'sunset_kalimba',
+      'midnight_love',
+      'crystal_dew',
+      'golden_heart',
+    ];
+    for (const variant of ringtoneVariants) {
+      const srcWav = path.join(rootDir, 'public', 'ringtones', `${variant}.wav`);
+      if (fs.existsSync(srcWav)) {
+        fs.copyFileSync(srcWav, path.join(rawResDir, `ringtone_${variant}.wav`));
+      }
     }
 
     // 2. Copy compiled dist/ web app directly into APK assets/www/
@@ -369,6 +388,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
+import android.media.MediaPlayer;
 import android.media.Ringtone;
 import android.media.RingtoneManager;
 import android.net.Uri;
@@ -397,6 +417,7 @@ public class EasyCallService extends Service {
     private static final int CALL_NOTIF_ID = 202;
 
     public static volatile boolean isAppForeground = false;
+    private static volatile MediaPlayer activeMediaPlayer = null;
     private static volatile Ringtone activeRingtone = null;
     private static volatile Vibrator activeVibrator = null;
     private static volatile String activeRingingCallId = null;
@@ -691,23 +712,60 @@ public class EasyCallService extends Service {
     private void startRinging() {
         try {
             stopRingingStatic(this);
-            Uri ringUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE);
-            if (ringUri != null) {
-                Ringtone rt = RingtoneManager.getRingtone(this, ringUri);
-                if (rt != null) {
-                    if (Build.VERSION.SDK_INT >= 28) {
-                        rt.setLooping(true);
+            boolean customStarted = false;
+            try {
+                SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                String selectedRingtone = prefs.getString("ringtoneId", "imo_velvet");
+                int rawId = R.raw.easycall_ringtone;
+                if ("imo_velvet".equals(selectedRingtone)) {
+                    rawId = R.raw.ringtone_imo_velvet;
+                } else if ("sunset_kalimba".equals(selectedRingtone)) {
+                    rawId = R.raw.ringtone_sunset_kalimba;
+                } else if ("midnight_love".equals(selectedRingtone)) {
+                    rawId = R.raw.ringtone_midnight_love;
+                } else if ("crystal_dew".equals(selectedRingtone)) {
+                    rawId = R.raw.ringtone_crystal_dew;
+                } else if ("golden_heart".equals(selectedRingtone)) {
+                    rawId = R.raw.ringtone_golden_heart;
+                }
+                MediaPlayer mp = new MediaPlayer();
+                if (Build.VERSION.SDK_INT >= 21) {
+                    mp.setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build());
+                }
+                Uri customUri = Uri.parse("android.resource://" + getPackageName() + "/" + rawId);
+                mp.setDataSource(this, customUri);
+                mp.setLooping(true);
+                mp.setVolume(1.0f, 1.0f);
+                mp.prepare();
+                mp.start();
+                activeMediaPlayer = mp;
+                customStarted = true;
+            } catch (Throwable ignored) {
+            }
+
+            if (!customStarted) {
+                Uri ringUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE);
+                if (ringUri != null) {
+                    Ringtone rt = RingtoneManager.getRingtone(this, ringUri);
+                    if (rt != null) {
+                        if (Build.VERSION.SDK_INT >= 28) {
+                            rt.setLooping(true);
+                        }
+                        if (Build.VERSION.SDK_INT >= 21) {
+                            rt.setAudioAttributes(new AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                                .build());
+                        }
+                        rt.play();
+                        activeRingtone = rt;
                     }
-                    if (Build.VERSION.SDK_INT >= 21) {
-                        rt.setAudioAttributes(new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                            .build());
-                    }
-                    rt.play();
-                    activeRingtone = rt;
                 }
             }
+
             Vibrator vib = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
             if (vib != null && vib.hasVibrator()) {
                 long[] pattern = new long[]{0, 600, 800};
@@ -724,6 +782,16 @@ public class EasyCallService extends Service {
 
     public static void stopRingingStatic(Context ctx) {
         activeRingingCallId = null;
+        try {
+            if (activeMediaPlayer != null) {
+                if (activeMediaPlayer.isPlaying()) {
+                    activeMediaPlayer.stop();
+                }
+                activeMediaPlayer.release();
+                activeMediaPlayer = null;
+            }
+        } catch (Throwable ignored) {
+        }
         try {
             if (activeRingtone != null) {
                 activeRingtone.stop();
@@ -852,6 +920,7 @@ public class MainActivity extends Activity {
             settings.setAllowContentAccess(true);
             settings.setUseWideViewPort(true);
             settings.setLoadWithOverviewMode(true);
+            webView.setNetworkAvailable(true);
 
             try {
                 CookieManager cookieManager = CookieManager.getInstance();
@@ -1021,6 +1090,7 @@ public class MainActivity extends Activity {
         super.onResume();
         EasyCallService.isAppForeground = true;
         if (webView != null) {
+            webView.setNetworkAvailable(true);
             webView.onResume();
             webView.evaluateJavascript("window.dispatchEvent(new Event('easycall:resume'))", null);
         }
@@ -1078,6 +1148,17 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void stopRinging() {
             EasyCallService.stopRingingStatic(MainActivity.this);
+        }
+
+        @JavascriptInterface
+        public void setRingtone(final String ringtoneId) {
+            try {
+                SharedPreferences prefs = getSharedPreferences(EasyCallService.PREFS_NAME, MODE_PRIVATE);
+                prefs.edit()
+                    .putString("ringtoneId", ringtoneId != null ? ringtoneId.trim() : "imo_velvet")
+                    .apply();
+            } catch (Throwable ignored) {
+            }
         }
 
         @JavascriptInterface

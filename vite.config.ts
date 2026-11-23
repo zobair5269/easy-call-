@@ -45,12 +45,14 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
-          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2,jpg}'],
-          navigateFallbackDenylist: [/^\/api\//, /^\/ws/],
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2,jpg,wav}'],
+          cleanupOutdatedCaches: true,
+          skipWaiting: true,
+          clientsClaim: true,
+          navigateFallbackDenylist: [/^\/api\//, /^\/ws/, /^\/easycall-config\.json$/],
         },
         devOptions: {
-          enabled: true,
-          type: 'module',
+          enabled: false,
         },
       }),
       {

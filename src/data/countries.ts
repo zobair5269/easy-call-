@@ -182,11 +182,21 @@ export function findCountryByIso(iso: string): CountryOption {
 }
 
 export function buildE164(countryCode: string, localNumber: string): string {
-  const digits = localNumber.replace(/\D/g, '').replace(/^0+/, '');
+  const rawTrimmed = localNumber.trim();
   const codeDigits = countryCode.replace(/\D/g, '');
-  if (!digits) return '';
-  if (localNumber.trim().startsWith('+')) {
-    return '+' + localNumber.replace(/\D/g, '');
+  if (rawTrimmed.startsWith('+')) {
+    let full = '+' + rawTrimmed.replace(/\D/g, '');
+    if (full.startsWith('+8800') && full.length >= 14) {
+      full = '+880' + full.slice(5);
+    }
+    return full.length > 4 ? full : '';
   }
+  let digits = rawTrimmed.replace(/\D/g, '');
+  if (!digits) return '';
+  if (codeDigits && digits.startsWith(codeDigits) && digits.length > codeDigits.length + 5) {
+    digits = digits.slice(codeDigits.length);
+  }
+  digits = digits.replace(/^0+/, '');
+  if (!digits) return '';
   return `+${codeDigits}${digits}`;
 }

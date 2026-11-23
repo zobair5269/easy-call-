@@ -1,10 +1,30 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
 import type { Request } from 'express';
-import { UPLOAD_DIR } from './db.ts';
+import { db, UPLOAD_DIR } from './db.ts';
 
-const SERVER_SECRET =
-  process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+function resolveServerSecret(): string {
+  const envSecret = process.env.SESSION_SECRET?.trim();
+  if (envSecret) return envSecret;
+  try {
+    const row = db
+      .prepare(`SELECT value FROM app_settings WHERE key = 'server_secret'`)
+      .get() as { value: string } | undefined;
+    if (row?.value) return row.value;
+    const generated = crypto.randomBytes(32).toString('hex');
+    db.prepare(
+      `INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES ('server_secret', ?, ?)`
+    ).run(generated, Date.now());
+    const saved = db
+      .prepare(`SELECT value FROM app_settings WHERE key = 'server_secret'`)
+      .get() as { value: string } | undefined;
+    return saved?.value || generated;
+  } catch {
+    return crypto.randomBytes(32).toString('hex');
+  }
+}
+
+const SERVER_SECRET = resolveServerSecret();
 
 export function hashWithServerSecret(value: string): string {
   return crypto.createHmac('sha256', SERVER_SECRET).update(value).digest('hex');
@@ -51,7 +71,10 @@ export function generateOtpCode(): string {
 }
 
 export function normalizePhoneE164(raw: string): string | null {
-  const cleaned = raw.trim().replace(/[\s\-().]/g, '');
+  let cleaned = raw.trim().replace(/[\s\-().]/g, '');
+  if (cleaned.startsWith('+8800') && cleaned.length >= 14) {
+    cleaned = '+880' + cleaned.slice(5);
+  }
   if (!/^\+[1-9]\d{5,14}$/.test(cleaned)) {
     return null;
   }

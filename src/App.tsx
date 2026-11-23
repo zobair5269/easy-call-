@@ -1,11 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Bell, Download, Home, Moon, PhoneCall, Settings, Sun, Users } from 'lucide-react';
+import { Bell, Download, Home, Moon, PhoneCall, Settings, Sun } from 'lucide-react';
 import { AdminBuilderPage } from './components/AdminBuilderPage';
 import { Avatar } from './components/Avatar';
 import { CallOverlay, type ActiveCallSession } from './components/CallOverlay';
 import { CallsTab } from './components/CallsTab';
 import { ChatDrawer } from './components/ChatDrawer';
-import { ContactsPanel } from './components/ContactsPanel';
 import { HomeTab } from './components/HomeTab';
 import { NotificationsDrawer } from './components/NotificationsDrawer';
 import { ProfileSettingsTab } from './components/ProfileSettingsTab';
@@ -17,18 +16,19 @@ import {
   clearNativeSessionAuth,
   hasNativeAndroidBridge,
   setNativeCallAudioMode,
+  setNativeRingtone,
   setNativeSpeakerphone,
   stopNativeRinging,
   syncNativeSessionAuth,
 } from './lib/nativeBridge';
-import { ringtone } from './lib/ringtone';
+import { getSelectedRingtoneId, ringtone } from './lib/ringtone';
 import { WssMediaRelay } from './lib/wssMediaRelay';
 import type {
   ActiveTab,
   AppNotification,
   CallRecordItem,
   ChatMessage,
-  FriendRequestItem,
+  HomeFeedItem,
   PublicUser,
   SelfUser,
 } from './types/app';
@@ -78,9 +78,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   });
 
   const [activeTab, setActiveTab] = useState<ActiveTab>('home');
-  const [friends, setFriends] = useState<PublicUser[]>([]);
-  const [incomingRequests, setIncomingRequests] = useState<FriendRequestItem[]>([]);
-  const [outgoingRequests, setOutgoingRequests] = useState<FriendRequestItem[]>([]);
+  const [homeFeed, setHomeFeed] = useState<HomeFeedItem[]>([]);
   const [calls, setCalls] = useState<CallRecordItem[]>([]);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
 
@@ -145,17 +143,49 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     document.documentElement.dir = meta.dir;
   }, [language]);
 
-  // Track browser network connectivity
+  // Track real network connectivity (verify against /api/health so Android WebView doesn't get stuck offline)
   useEffect(() => {
-    const up = () => setIsOnline(true);
-    const down = () => setIsOnline(false);
+    let cancelled = false;
+    const probeServer = async () => {
+      try {
+        await initApiConfig();
+        const res = await fetch(resolveApiUrl('/api/health'), { cache: 'no-store' });
+        if (!cancelled && res.ok) {
+          setIsOnline(true);
+        }
+      } catch {
+        // Leave current state
+      }
+    };
+    const up = () => {
+      setIsOnline(true);
+      probeServer();
+    };
+    const down = () => {
+      setIsOnline(false);
+      window.setTimeout(probeServer, 1200);
+    };
     window.addEventListener('online', up);
     window.addEventListener('offline', down);
+    window.addEventListener('easycall:resume', up);
+    window.addEventListener('focus', probeServer);
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      probeServer();
+    }
     return () => {
+      cancelled = true;
       window.removeEventListener('online', up);
       window.removeEventListener('offline', down);
+      window.removeEventListener('easycall:resume', up);
+      window.removeEventListener('focus', probeServer);
     };
   }, []);
+
+  useEffect(() => {
+    if (wsConnected) {
+      setIsOnline(true);
+    }
+  }, [wsConnected]);
 
   // Sync callSessionRef & active duration timer
   useEffect(() => {
@@ -194,19 +224,14 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const refreshAllData = useCallback(async () => {
     if (!user) return;
     try {
-      const [frRes, reqRes, callRes, notifRes] = await Promise.all([
-        apiFetch<{ friends: PublicUser[] }>('/api/friends'),
-        apiFetch<{ incoming: FriendRequestItem[]; outgoing: FriendRequestItem[] }>(
-          '/api/friend-requests'
-        ),
+      const [feedRes, callRes, notifRes] = await Promise.all([
+        apiFetch<{ items: HomeFeedItem[] }>('/api/home-feed'),
         apiFetch<{ calls: CallRecordItem[] }>('/api/calls'),
         apiFetch<{ notifications: AppNotification[] }>('/api/notifications'),
       ]);
-      setFriends(frRes.friends);
-      setIncomingRequests(reqRes.incoming);
-      setOutgoingRequests(reqRes.outgoing);
-      setCalls(callRes.calls);
-      setNotifications(notifRes.notifications);
+      setHomeFeed(feedRes.items || []);
+      setCalls(callRes.calls || []);
+      setNotifications(notifRes.notifications || []);
     } catch {
       // Ignore transient refresh failure
     }
@@ -232,6 +257,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     if (user) {
       refreshAllData();
       syncNativeSessionAuth(resolveApiUrl(''), getAuthToken() || '', user.id);
+      setNativeRingtone(getSelectedRingtoneId());
       const tok = getAuthToken();
       fetch(resolveApiUrl('/api/admin/status'), {
         headers: tok ? { 'X-User-Token': tok } : {},
@@ -385,7 +411,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   );
 
   const activateMediaRelay = useCallback(
-    (callId: string, targetUserId: string, callType: 'audio' | 'video') => {
+    (callId: string, targetUserId: string, callType: 'audio' | 'video', notifyPeer = true) => {
       if (relayActiveRef.current || !callSessionRef.current || callSessionRef.current.callId !== callId) {
         return;
       }
@@ -397,6 +423,16 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       ringtone.stop();
       stopNativeRinging();
       setNativeCallAudioMode(true, speakerOnRef.current);
+
+      if (notifyPeer && wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'relay:activate',
+            callId,
+            targetUserId,
+          })
+        );
+      }
 
       const relay = new WssMediaRelay();
       relayRef.current = relay;
@@ -433,7 +469,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         },
       });
       if (!hasNativeAndroidBridge()) {
-        relay.setOutputGain(speakerOnRef.current ? 1 : 0);
+        relay.setOutputGain(speakerOnRef.current ? 1 : 0.45);
       }
 
       setCallSession((prev) =>
@@ -450,18 +486,37 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       if (relayFallbackTimerRef.current !== null) {
         window.clearTimeout(relayFallbackTimerRef.current);
       }
-      relayFallbackTimerRef.current = window.setTimeout(() => {
+      relayFallbackTimerRef.current = window.setTimeout(async () => {
         relayFallbackTimerRef.current = null;
+        if (callSessionRef.current?.callId !== callId || relayActiveRef.current) return;
         const pc = pcRef.current;
         const p2pConnected =
           pc &&
           (pc.connectionState === 'connected' ||
             pc.iceConnectionState === 'connected' ||
             pc.iceConnectionState === 'completed');
-        if (!p2pConnected && callSessionRef.current?.callId === callId) {
-          activateMediaRelay(callId, targetUserId, callType);
+
+        if (!p2pConnected) {
+          activateMediaRelay(callId, targetUserId, callType, true);
+          return;
         }
-      }, 4500);
+
+        // Verify actual RTP packets are flowing over P2P (some CGNAT routers report connected then blackhole UDP)
+        try {
+          let inboundBytes = 0;
+          const stats = await pc.getStats();
+          stats.forEach((report) => {
+            if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+              inboundBytes += Number(report.bytesReceived || 0);
+            }
+          });
+          if (inboundBytes === 0 && callSessionRef.current?.callId === callId) {
+            activateMediaRelay(callId, targetUserId, callType, true);
+          }
+        } catch {
+          // Ignore stats errors
+        }
+      }, 4200);
     },
     [activateMediaRelay]
   );
@@ -533,23 +588,13 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         const iceState = pc.iceConnectionState;
 
         if (connState === 'connected' || iceState === 'completed' || (iceState === 'connected' && connState !== 'failed')) {
-          if (relayFallbackTimerRef.current !== null) {
-            window.clearTimeout(relayFallbackTimerRef.current);
-            relayFallbackTimerRef.current = null;
-          }
           ringtone.stop();
           stopNativeRinging();
           setNativeCallAudioMode(true, speakerOnRef.current);
-          if (relayActiveRef.current && connState === 'connected' && rStream.getTracks().length > 0) {
-            relayRef.current?.stop();
-            relayRef.current = null;
-            relayActiveRef.current = false;
-            setRelayVideoFrame(null);
-          }
           setCallSession((prev) => (prev ? { ...prev, phase: 'connected' } : prev));
         } else if (connState === 'failed' || iceState === 'failed' || iceState === 'disconnected') {
           if (!relayActiveRef.current) {
-            activateMediaRelay(callId, targetUserId, callType);
+            activateMediaRelay(callId, targetUserId, callType, true);
           }
           if (isCaller && wsRef.current?.readyState === WebSocket.OPEN) {
             pc.createOffer({ iceRestart: true })
@@ -622,21 +667,17 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         } else if (msg.type === 'presence:update') {
           const uid = String(msg.userId);
           const online = Boolean(msg.online);
-          setFriends((prev) =>
-            prev.map((f) => (f.id === uid ? { ...f, online } : f))
+          setHomeFeed((prev) =>
+            prev.map((item) =>
+              item.peer.id === uid ? { ...item, peer: { ...item.peer, online } } : item
+            )
           );
         } else if (msg.type === 'friend_request:new' || msg.type === 'friend_request:accepted' || msg.type === 'friends:refresh' || msg.type === 'notifications:refresh') {
           refreshAllData();
-          if (msg.type === 'friend_request:new' && 'Notification' in window && Notification.permission === 'granted') {
-            try {
-              new Notification('EASY CALL', { body: 'You received a new Friend Request.' });
-            } catch {
-              // Android WebView may disallow direct Notification constructor
-            }
-          }
         } else if (msg.type === 'chat:message' && msg.message) {
           const m = msg.message as ChatMessage;
           setLiveMessages((prev) => [...prev, m]);
+          refreshAllData();
         } else if (msg.type === 'call:created') {
           const callId = String(msg.callId);
           if (callSessionRef.current) {
@@ -747,11 +788,16 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           } else {
             pendingIceRef.current.push(cand);
           }
+        } else if (msg.type === 'relay:activate') {
+          const current = callSessionRef.current;
+          if (current && current.callId === String(msg.callId) && !relayActiveRef.current) {
+            activateMediaRelay(current.callId, current.peer.id, current.callType, false);
+          }
         } else if (msg.type === 'relay:audio' && typeof msg.pcm === 'string') {
           const current = callSessionRef.current;
           if (current && current.callId === String(msg.callId)) {
             if (!relayActiveRef.current) {
-              activateMediaRelay(current.callId, current.peer.id, current.callType);
+              activateMediaRelay(current.callId, current.peer.id, current.callType, false);
             }
             relayRef.current?.playIncomingAudio(msg.pcm, Number(msg.sr) || 16000);
           }
@@ -759,7 +805,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           const current = callSessionRef.current;
           if (current && current.callId === String(msg.callId)) {
             if (!relayActiveRef.current) {
-              activateMediaRelay(current.callId, current.peer.id, current.callType);
+              activateMediaRelay(current.callId, current.peer.id, current.callType, false);
             }
             setRelayVideoFrame(msg.jpg);
           }
@@ -816,6 +862,15 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     callSessionRef.current = sessionDraft;
     setCallSession(sessionDraft);
     ringtone.startOutgoing();
+    try {
+      const AC =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const u = new AC();
+      u.resume().finally(() => u.close().catch(() => {}));
+    } catch {
+      // Ignore AudioContext unlock errors
+    }
 
     await acquireUserMedia(callType, 'user');
     if (!callSessionRef.current) {
@@ -847,6 +902,15 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     ringtone.stop();
     stopNativeRinging();
     setNativeCallAudioMode(true, speakerOnRef.current);
+    try {
+      const AC =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const u = new AC();
+      u.resume().finally(() => u.close().catch(() => {}));
+    } catch {
+      // Ignore AudioContext unlock errors
+    }
     const connectingSession: ActiveCallSession = { ...current, phase: 'connecting' };
     callSessionRef.current = connectingSession;
     setCallSession(connectingSession);
@@ -1039,13 +1103,12 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             </span>
           </button>
 
-          {/* Desktop Nav Links (Top Bar Contract: clean single-line text links) */}
+          {/* Desktop Nav Links (Clean imo-style 3 tabs: Home, Calls, Settings) */}
           <nav className="hidden md:flex items-center gap-7 text-sm font-medium text-slate-600 dark:text-slate-300">
             {(
               [
                 ['home', t('navHome')],
                 ['calls', t('navCalls')],
-                ['contacts', t('navContacts')],
                 ['settings', t('navSettings')],
               ] as const
             ).map(([key, label]) => (
@@ -1060,9 +1123,6 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
                 }`}
               >
                 {label}
-                {key === 'contacts' && incomingRequests.length > 0
-                  ? ` (${incomingRequests.length})`
-                  : ''}
               </button>
             ))}
           </nav>
@@ -1115,7 +1175,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         </div>
       </header>
 
-      {!isOnline && (
+      {!isOnline && !wsConnected && (
         <div className="bg-amber-500 px-4 py-2 text-center text-xs font-semibold text-white">
           No internet connection detected. Calls require an active internet or mobile data network.
         </div>
@@ -1141,17 +1201,10 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         {activeTab === 'home' && (
           <HomeTab
             language={language}
-            friends={friends}
-            incomingRequests={incomingRequests}
+            homeFeed={homeFeed}
             recentCalls={calls}
             onStartCall={startOutgoingCall}
             onOpenChat={(f) => setActiveChatFriend(f)}
-            onOpenQr={() => {
-              setQrInitialTab('scan');
-              setQrOpen(true);
-            }}
-            onOpenContacts={() => setActiveTab('contacts')}
-            onOpenCalls={() => setActiveTab('calls')}
             onRefreshAll={refreshAllData}
           />
         )}
@@ -1163,21 +1216,9 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             onClearHistory={async () => {
               await apiFetch('/api/calls', { method: 'DELETE' }).catch(() => {});
               setCalls([]);
+              refreshAllData();
             }}
             onCallback={startOutgoingCall}
-          />
-        )}
-
-        {activeTab === 'contacts' && (
-          <ContactsPanel
-            language={language}
-            incomingRequests={incomingRequests}
-            outgoingRequests={outgoingRequests}
-            onRefreshAll={refreshAllData}
-            onOpenQrScanner={() => {
-              setQrInitialTab('scan');
-              setQrOpen(true);
-            }}
           />
         )}
 
@@ -1200,24 +1241,23 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
               clearNativeSessionAuth();
               setAuthToken(null);
               setUser(null);
-              setFriends([]);
+              setHomeFeed([]);
               setCalls([]);
             }}
           />
         )}
       </main>
 
-      {/* Mobile Fixed Bottom Thumb Navigation (<= 15% mobile height) */}
+      {/* Mobile Fixed Bottom Thumb Navigation */}
       <nav className="md:hidden fixed bottom-0 inset-x-0 z-30 border-t border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md pb-safe">
-        <div className="grid grid-cols-4 h-16 items-center">
+        <div className="grid grid-cols-3 h-16 items-center">
           {(
             [
-              ['home', t('navHome'), Home, 0],
-              ['calls', t('navCalls'), PhoneCall, 0],
-              ['contacts', t('navContacts'), Users, incomingRequests.length],
-              ['settings', t('navSettings'), Settings, 0],
+              ['home', t('navHome'), Home],
+              ['calls', t('navCalls'), PhoneCall],
+              ['settings', t('navSettings'), Settings],
             ] as const
-          ).map(([key, label, Icon, badge]) => {
+          ).map(([key, label, Icon]) => {
             const active = activeTab === key;
             return (
               <button
@@ -1232,11 +1272,6 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
               >
                 <Icon className="h-5 w-5" />
                 <span className="mt-1 text-[11px] leading-none truncate max-w-[72px]">{label}</span>
-                {badge > 0 && (
-                  <span className="absolute top-1.5 end-5 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-rose-600 px-1 text-[10px] font-bold text-white">
-                    {badge}
-                  </span>
-                )}
               </button>
             );
           })}
@@ -1269,7 +1304,10 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         selfUser={user}
         language={language}
         incomingMessages={liveMessages}
-        onClose={() => setActiveChatFriend(null)}
+        onClose={() => {
+          setActiveChatFriend(null);
+          refreshAllData();
+        }}
         onStartCall={(f, type) => {
           setActiveChatFriend(null);
           startOutgoingCall(f, type);
@@ -1299,7 +1337,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             const next = !prev;
             setNativeSpeakerphone(next);
             if (!hasNativeAndroidBridge()) {
-              relayRef.current?.setOutputGain(next ? 1 : 0);
+              relayRef.current?.setOutputGain(next ? 1 : 0.45);
             }
             return next;
           });

@@ -97,7 +97,7 @@ export class WssMediaRelay {
           for (let i = 0; i < down.length; i++) {
             this.sampleBuffer.push(down[i]);
           }
-          if (this.sampleBuffer.length >= 1600) {
+          while (this.sampleBuffer.length >= 1600) {
             const batch = new Int16Array(this.sampleBuffer.splice(0, 1600));
             opts.onSendAudio(int16ToBase64(batch), 16000);
           }

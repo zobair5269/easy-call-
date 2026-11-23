@@ -91,8 +91,8 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
         if (remoteAudioRef.current.srcObject !== remoteStream) {
           remoteAudioRef.current.srcObject = remoteStream;
         }
-        remoteAudioRef.current.muted = isNative ? false : !speakerOn;
-        remoteAudioRef.current.volume = 1;
+        remoteAudioRef.current.muted = false;
+        remoteAudioRef.current.volume = isNative ? 1 : speakerOn ? 1 : 0.45;
         remoteAudioRef.current.play().catch(() => {});
       }
     };

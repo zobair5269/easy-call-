@@ -4,7 +4,7 @@ services:
     runtime: node
     plan: free
     buildCommand: npm install --legacy-peer-deps --include=dev && npm run build
-    startCommand: npm start
+    startCommand: ./node_modules/.bin/tsx server.ts
     healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV

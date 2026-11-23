@@ -73,4 +73,25 @@ export interface AppNotification {
   createdAt: number;
 }
 
+export interface HomeFeedItem {
+  peer: PublicUser;
+  lastActivityAt: number;
+  lastCall: {
+    id: string;
+    direction: 'incoming' | 'outgoing';
+    callType: 'audio' | 'video';
+    status: string;
+    durationSec: number;
+    startedAt: number;
+  } | null;
+  lastMessage: {
+    id: string;
+    senderId: string;
+    body: string;
+    hasImage: boolean;
+    createdAt: number;
+  } | null;
+  unreadCount: number;
+}
+
 export type ActiveTab = 'home' | 'calls' | 'contacts' | 'settings';

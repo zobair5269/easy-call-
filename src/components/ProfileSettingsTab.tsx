@@ -6,14 +6,24 @@ import {
   KeyRound,
   LogOut,
   Moon,
+  Music,
   QrCode,
   Shield,
+  Square,
   Sun,
   Trash2,
+  Volume2,
   Wifi,
 } from 'lucide-react';
 import { SUPPORTED_LANGUAGES, translate, type TranslationKeys } from '../i18n/translations';
 import { apiFetch, fileToCompressedDataUrl } from '../lib/api';
+import {
+  getSelectedRingtoneId,
+  ringtone,
+  ROMANTIC_RINGTONES,
+  setSelectedRingtoneId,
+  type RomanticRingtoneId,
+} from '../lib/ringtone';
 import type { PublicUser, SelfUser } from '../types/app';
 import { Avatar } from './Avatar';
 import { PWAInstallButton } from './PWAInstallButton';
@@ -52,6 +62,14 @@ export const ProfileSettingsTab: React.FC<ProfileSettingsTabProps> = ({
   const [savedFlag, setSavedFlag] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [previewingId, setPreviewingId] = useState<RomanticRingtoneId | null>(null);
+  const [confirmedRingtoneId, setConfirmedRingtoneId] = useState<RomanticRingtoneId>(() =>
+    getSelectedRingtoneId()
+  );
+  const [draftRingtoneId, setDraftRingtoneId] = useState<RomanticRingtoneId>(() =>
+    getSelectedRingtoneId()
+  );
+  const [ringtoneConfirmedNotice, setRingtoneConfirmedNotice] = useState(false);
 
   useEffect(() => {
     setDisplayName(selfUser.displayName);
@@ -66,6 +84,12 @@ export const ProfileSettingsTab: React.FC<ProfileSettingsTabProps> = ({
     apiFetch<{ blocked: PublicUser[] }>('/api/blocks')
       .then((res) => setBlockedUsers(res.blocked))
       .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      ringtone.stop();
+    };
   }, []);
 
   const saveChanges = async (patch: Record<string, unknown>) => {
@@ -298,6 +322,134 @@ export const ProfileSettingsTab: React.FC<ProfileSettingsTabProps> = ({
             className="h-5 w-5 accent-teal-700 shrink-0"
           />
         </label>
+
+        {/* Romantic Ringtone Audition & Selector */}
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 p-4 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-start gap-3">
+              <Music className="mt-0.5 h-5 w-5 text-teal-700 dark:text-teal-400 shrink-0" />
+              <div>
+                <p className="font-semibold text-slate-900 dark:text-white">
+                  EASY CALL Ringtone (5 Romantic Options)
+                </p>
+                <p className="text-xs text-slate-600 dark:text-slate-400">
+                  আগে শুনুন, পছন্দেরটা বেছে নিয়ে Confirm চাপুন
+                </p>
+              </div>
+            </div>
+            {ringtoneConfirmedNotice && (
+              <span className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white">
+                <Check className="h-3.5 w-3.5" />
+                Confirmed
+              </span>
+            )}
+          </div>
+
+          <div className="space-y-2">
+            {ROMANTIC_RINGTONES.map((item) => {
+              const isPlaying = previewingId === item.id;
+              const isDraftSelected = draftRingtoneId === item.id;
+              const isActive = confirmedRingtoneId === item.id;
+              return (
+                <div
+                  key={item.id}
+                  onClick={() => setDraftRingtoneId(item.id)}
+                  className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border p-3 cursor-pointer transition-colors ${
+                    isDraftSelected
+                      ? 'border-teal-600 bg-white dark:bg-slate-900 shadow-xs'
+                      : 'border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-900/60 hover:bg-white dark:hover:bg-slate-900'
+                  }`}
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <span
+                      className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full border ${
+                        isDraftSelected
+                          ? 'border-teal-600 bg-teal-600 text-white'
+                          : 'border-slate-300 dark:border-slate-600'
+                      }`}
+                    >
+                      {isDraftSelected && <Check className="h-3 w-3" />}
+                    </span>
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-sm font-semibold text-slate-900 dark:text-white truncate">
+                          {item.title}
+                        </p>
+                        <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
+                          {item.durationLabel}
+                        </span>
+                        {isActive && (
+                          <span className="rounded-md bg-teal-100 dark:bg-teal-900/50 px-2 py-0.5 text-[11px] font-semibold text-teal-800 dark:text-teal-300">
+                            Active
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-slate-600 dark:text-slate-400">
+                        {item.subtitle}
+                      </p>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setDraftRingtoneId(item.id);
+                      if (isPlaying) {
+                        ringtone.stop();
+                        setPreviewingId(null);
+                      } else {
+                        ringtone.preview(item.id);
+                        setPreviewingId(item.id);
+                      }
+                    }}
+                    className={`inline-flex min-h-[38px] items-center gap-1.5 rounded-xl px-3.5 text-xs font-semibold transition-colors shrink-0 ${
+                      isPlaying
+                        ? 'bg-rose-600 text-white hover:bg-rose-700'
+                        : 'bg-slate-900 dark:bg-slate-700 text-white hover:bg-slate-800'
+                    }`}
+                  >
+                    {isPlaying ? (
+                      <>
+                        <Square className="h-3 w-3 fill-current" />
+                        Stop
+                      </>
+                    ) : (
+                      <>
+                        <Volume2 className="h-3.5 w-3.5" />
+                        Listen
+                      </>
+                    )}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+            <p className="text-xs text-slate-600 dark:text-slate-400">
+              Selected:{' '}
+              <span className="font-semibold text-slate-900 dark:text-white">
+                {ROMANTIC_RINGTONES.find((r) => r.id === draftRingtoneId)?.title}
+              </span>
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedRingtoneId(draftRingtoneId);
+                setConfirmedRingtoneId(draftRingtoneId);
+                ringtone.stop();
+                setPreviewingId(null);
+                setRingtoneConfirmedNotice(true);
+                setTimeout(() => setRingtoneConfirmedNotice(false), 3000);
+              }}
+              className="inline-flex min-h-[42px] items-center gap-2 rounded-xl bg-teal-700 px-4 py-2 text-xs font-semibold text-white hover:bg-teal-800"
+            >
+              <Check className="h-4 w-4" />
+              {confirmedRingtoneId === draftRingtoneId ? 'Confirmed' : 'Confirm Selected Ringtone'}
+            </button>
+          </div>
+        </div>
       </section>
 
       {/* Privacy & Security Controls */}

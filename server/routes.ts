@@ -636,7 +636,7 @@ export function createApiRouter(): Router {
 
   router.get('/users/search', requireAuth, (req: AuthedRequest, res) => {
     const user = req.user!;
-    if (!checkRateLimit(`search:${user.id}`, 30, 60_000)) {
+    if (!checkRateLimit(`search:${user.id}`, 60, 60_000)) {
       res.status(429).json({ error: 'Search rate limit reached. Please slow down.' });
       return;
     }
@@ -651,79 +651,66 @@ export function createApiRouter(): Router {
     const cleanedCode = q.replace(/\s+/g, '');
     const isCountryCode = /^\+[1-9]\d{0,3}$/.test(cleanedCode);
     const digitsOnly = q.replace(/\D/g, '');
+    const isPhoneQuery =
+      Boolean(exactPhone) ||
+      (digitsOnly.length >= 3 && q.replace(/[\s\-()+.]/g, '') === digitsOnly);
+
     let rows: UserRow[] = [];
 
     if (exactPhone) {
+      const noPlus = exactPhone.slice(1);
       rows = db
         .prepare(
           `SELECT * FROM users
-           WHERE phone_e164 = ? AND id != ? AND discoverable_by_phone = 1
-           LIMIT 10`
+           WHERE id != ? AND (phone_e164 = ? OR phone_e164 LIKE ?)
+           ORDER BY last_seen_at DESC
+           LIMIT 20`
         )
-        .all(exactPhone, user.id) as unknown as UserRow[];
+        .all(user.id, exactPhone, `%${noPlus}%`) as unknown as UserRow[];
     } else if (isCountryCode) {
       const prefixPattern = `${cleanedCode}%`;
       rows = db
         .prepare(
           `SELECT * FROM users
-           WHERE (country_code = ? OR phone_e164 LIKE ?) AND id != ? AND discoverable_by_phone = 1
+           WHERE (country_code = ? OR phone_e164 LIKE ?) AND id != ?
            ORDER BY last_seen_at DESC
            LIMIT 25`
         )
         .all(cleanedCode, prefixPattern, user.id) as unknown as UserRow[];
-    } else if (/^\d{5,15}$/.test(digitsOnly) && q.replace(/[\s\-()+]/g, '') === digitsOnly) {
+    } else if (isPhoneQuery) {
       const strippedDigits = digitsOnly.replace(/^0+/, '') || digitsOnly;
-      const phoneSuffixPattern = `%${digitsOnly}`;
-      const strippedSuffixPattern = `%${strippedDigits}`;
+      const containsDigits = `%${digitsOnly}%`;
+      const containsStripped = `%${strippedDigits}%`;
       rows = db
         .prepare(
           `SELECT * FROM users
-           WHERE id != ? AND discoverable_by_phone = 1
-             AND (phone_e164 LIKE ? OR phone_e164 LIKE ?)
+           WHERE id != ? AND (phone_e164 LIKE ? OR phone_e164 LIKE ?)
            ORDER BY last_seen_at DESC
-           LIMIT 20`
+           LIMIT 25`
         )
-        .all(user.id, phoneSuffixPattern, strippedSuffixPattern) as unknown as UserRow[];
+        .all(user.id, containsDigits, containsStripped) as unknown as UserRow[];
     } else {
       const pattern = `%${q}%`;
       rows = db
         .prepare(
           `SELECT * FROM users
-           WHERE id != ? AND discoverable_by_name = 1 AND display_name LIKE ?
+           WHERE id != ? AND (display_name LIKE ? COLLATE NOCASE OR phone_e164 LIKE ? OR qr_token = ?)
            ORDER BY last_seen_at DESC
-           LIMIT 20`
+           LIMIT 25`
         )
-        .all(user.id, pattern) as unknown as UserRow[];
+        .all(user.id, pattern, pattern, q) as unknown as UserRow[];
     }
 
     const results = rows
       .filter((r) => !isBlockedBetween(user.id, r.id))
       .map((r) => {
         const friend = areFriends(user.id, r.id);
-        const pendingOut = Boolean(
-          db
-            .prepare(
-              `SELECT 1 FROM friend_requests WHERE from_user_id = ? AND to_user_id = ? AND status = 'pending'`
-            )
-            .get(user.id, r.id)
-        );
-        const pendingIn = Boolean(
-          db
-            .prepare(
-              `SELECT 1 FROM friend_requests WHERE from_user_id = ? AND to_user_id = ? AND status = 'pending'`
-            )
-            .get(r.id, user.id)
-        );
         return {
-          ...getPublicUserView(r, friend),
+          ...getPublicUserView(r, true),
+          online: r.show_online_status ? isUserOnline(r.id) : false,
+          showOnlineStatus: Boolean(r.show_online_status),
           isFriend: friend,
-          requestStatus: friend
-            ? 'accepted'
-            : pendingOut
-              ? 'outgoing_pending'
-              : pendingIn
-                ? 'incoming_pending'
-                : 'none',
+          requestStatus: friend ? 'accepted' : 'none',
         };
       });
 
@@ -1175,11 +1162,154 @@ export function createApiRouter(): Router {
         startedAt: r.started_at,
         endedAt: r.ended_at,
         durationSec: r.duration_sec,
-        canCallback: areFriends(user.id, peerId) && !isBlockedBetween(user.id, peerId),
+        canCallback: !isBlockedBetween(user.id, peerId),
       };
     });
 
     res.json({ calls });
+  });
+
+  router.get('/home-feed', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    const peerActivity = new Map<
+      string,
+      {
+        lastActivityAt: number;
+        lastCall?: {
+          id: string;
+          direction: 'incoming' | 'outgoing';
+          callType: 'audio' | 'video';
+          status: string;
+          durationSec: number;
+          startedAt: number;
+        };
+        lastMessage?: {
+          id: string;
+          senderId: string;
+          body: string;
+          hasImage: boolean;
+          createdAt: number;
+        };
+        unreadCount: number;
+      }
+    >();
+
+    const callRows = db
+      .prepare(
+        `SELECT id, caller_id, callee_id, call_type, status, started_at, duration_sec
+         FROM call_records
+         WHERE (caller_id = ? AND hidden_for_caller = 0)
+            OR (callee_id = ? AND hidden_for_callee = 0)
+         ORDER BY started_at DESC
+         LIMIT 200`
+      )
+      .all(user.id, user.id) as Array<{
+      id: string;
+      caller_id: string;
+      callee_id: string;
+      call_type: 'audio' | 'video';
+      status: string;
+      started_at: number;
+      duration_sec: number;
+    }>;
+
+    for (const c of callRows) {
+      const peerId = c.caller_id === user.id ? c.callee_id : c.caller_id;
+      if (peerId === user.id) continue;
+      const existing = peerActivity.get(peerId) || { lastActivityAt: 0, unreadCount: 0 };
+      if (!existing.lastCall) {
+        existing.lastCall = {
+          id: c.id,
+          direction: c.caller_id === user.id ? 'outgoing' : 'incoming',
+          callType: c.call_type,
+          status: c.status,
+          durationSec: c.duration_sec,
+          startedAt: c.started_at,
+        };
+      }
+      if (c.started_at > existing.lastActivityAt) {
+        existing.lastActivityAt = c.started_at;
+      }
+      peerActivity.set(peerId, existing);
+    }
+
+    const msgRows = db
+      .prepare(
+        `SELECT id, sender_id, receiver_id, body, image_id, status, created_at
+         FROM messages
+         WHERE sender_id = ? OR receiver_id = ?
+         ORDER BY created_at DESC
+         LIMIT 300`
+      )
+      .all(user.id, user.id) as Array<{
+      id: string;
+      sender_id: string;
+      receiver_id: string;
+      body: string;
+      image_id: string | null;
+      status: string;
+      created_at: number;
+    }>;
+
+    for (const m of msgRows) {
+      const peerId = m.sender_id === user.id ? m.receiver_id : m.sender_id;
+      if (peerId === user.id) continue;
+      const existing = peerActivity.get(peerId) || { lastActivityAt: 0, unreadCount: 0 };
+      if (!existing.lastMessage) {
+        existing.lastMessage = {
+          id: m.id,
+          senderId: m.sender_id,
+          body: m.body,
+          hasImage: Boolean(m.image_id),
+          createdAt: m.created_at,
+        };
+      }
+      if (m.receiver_id === user.id && m.status !== 'read') {
+        existing.unreadCount += 1;
+      }
+      if (m.created_at > existing.lastActivityAt) {
+        existing.lastActivityAt = m.created_at;
+      }
+      peerActivity.set(peerId, existing);
+    }
+
+    const friendRows = db
+      .prepare(
+        `SELECT CASE WHEN user_a = ? THEN user_b ELSE user_a END AS peer_id, created_at
+         FROM friendships WHERE user_a = ? OR user_b = ?`
+      )
+      .all(user.id, user.id, user.id) as Array<{ peer_id: string; created_at: number }>;
+
+    for (const f of friendRows) {
+      if (f.peer_id === user.id || peerActivity.has(f.peer_id)) continue;
+      peerActivity.set(f.peer_id, {
+        lastActivityAt: f.created_at,
+        unreadCount: 0,
+      });
+    }
+
+    const items: Array<Record<string, unknown>> = [];
+    const userStmt = db.prepare('SELECT * FROM users WHERE id = ?');
+
+    for (const [peerId, info] of peerActivity.entries()) {
+      if (isBlockedBetween(user.id, peerId)) continue;
+      const peerRow = userStmt.get(peerId) as UserRow | undefined;
+      if (!peerRow) continue;
+      items.push({
+        peer: {
+          ...getPublicUserView(peerRow, true),
+          online: peerRow.show_online_status ? isUserOnline(peerRow.id) : false,
+          showOnlineStatus: Boolean(peerRow.show_online_status),
+        },
+        lastActivityAt: info.lastActivityAt,
+        lastCall: info.lastCall || null,
+        lastMessage: info.lastMessage || null,
+        unreadCount: info.unreadCount,
+      });
+    }
+
+    items.sort((a, b) => Number(b.lastActivityAt) - Number(a.lastActivityAt));
+    res.json({ items });
   });
 
   router.delete('/calls', requireAuth, (req: AuthedRequest, res) => {
@@ -1192,8 +1322,9 @@ export function createApiRouter(): Router {
   router.get('/messages/:friendId', requireAuth, (req: AuthedRequest, res) => {
     const user = req.user!;
     const friendId = req.params.friendId;
-    if (!areFriends(user.id, friendId) || isBlockedBetween(user.id, friendId)) {
-      res.status(403).json({ error: 'Messaging is only available between accepted friends.' });
+    const targetExists = db.prepare('SELECT 1 FROM users WHERE id = ?').get(friendId);
+    if (!targetExists || isBlockedBetween(user.id, friendId)) {
+      res.status(403).json({ error: 'Unable to open chat with this user.' });
       return;
     }
 
@@ -1235,8 +1366,9 @@ export function createApiRouter(): Router {
   router.post('/messages/:friendId', requireAuth, (req: AuthedRequest, res) => {
     const user = req.user!;
     const friendId = req.params.friendId;
-    if (!areFriends(user.id, friendId) || isBlockedBetween(user.id, friendId)) {
-      res.status(403).json({ error: 'Messaging is only available between accepted friends.' });
+    const targetExists = db.prepare('SELECT 1 FROM users WHERE id = ?').get(friendId);
+    if (!targetExists || isBlockedBetween(user.id, friendId)) {
+      res.status(403).json({ error: 'Unable to send message to this user.' });
       return;
     }
 

@@ -1,75 +1,113 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Flag,
+  Loader2,
   MessageSquare,
   MoreVertical,
   Phone,
-  QrCode,
+  PhoneIncoming,
+  PhoneMissed,
+  PhoneOutgoing,
   Search,
   ShieldAlert,
-  UserMinus,
-  UserPlus,
-  Users,
   Video,
+  X,
 } from 'lucide-react';
 import { translate, type TranslationKeys } from '../i18n/translations';
 import { apiFetch } from '../lib/api';
-import type { CallRecordItem, FriendRequestItem, PublicUser } from '../types/app';
+import type { CallRecordItem, HomeFeedItem, PublicUser } from '../types/app';
 import { Avatar } from './Avatar';
 
 interface HomeTabProps {
   language: string;
-  friends: PublicUser[];
-  incomingRequests: FriendRequestItem[];
+  homeFeed: HomeFeedItem[];
   recentCalls: CallRecordItem[];
-  onStartCall: (friend: PublicUser, callType: 'audio' | 'video') => void;
-  onOpenChat: (friend: PublicUser) => void;
-  onOpenQr: () => void;
-  onOpenContacts: () => void;
-  onOpenCalls: () => void;
+  onStartCall: (peer: PublicUser, callType: 'audio' | 'video') => void;
+  onOpenChat: (peer: PublicUser) => void;
   onRefreshAll: () => void;
+}
+
+function formatShortTime(ts: number): string {
+  try {
+    const d = new Date(ts);
+    const now = new Date();
+    if (d.toDateString() === now.toDateString()) {
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  } catch {
+    return '';
+  }
+}
+
+function formatDuration(sec: number): string {
+  if (!sec || sec <= 0) return '';
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
 }
 
 export const HomeTab: React.FC<HomeTabProps> = ({
   language,
-  friends,
-  incomingRequests,
+  homeFeed,
   recentCalls,
   onStartCall,
   onOpenChat,
-  onOpenQr,
-  onOpenContacts,
-  onOpenCalls,
   onRefreshAll,
 }) => {
   const t = (key: TranslationKeys) => translate(language, key);
-  const [filter, setFilter] = useState('');
-  const [menuFriendId, setMenuFriendId] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
+  const [searching, setSearching] = useState(false);
+  const [searchResults, setSearchResults] = useState<PublicUser[]>([]);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [menuUserId, setMenuUserId] = useState<string | null>(null);
   const [reportTarget, setReportTarget] = useState<PublicUser | null>(null);
   const [reportReason, setReportReason] = useState('Harassment or spam');
   const [actionMsg, setActionMsg] = useState<string | null>(null);
 
-  const visibleFriends = useMemo(() => {
-    const q = filter.trim().toLowerCase();
-    if (!q) return friends;
-    return friends.filter(
-      (f) =>
-        f.displayName.toLowerCase().includes(q) ||
-        (f.phoneE164 && f.phoneE164.toLowerCase().includes(q))
-    );
-  }, [friends, filter]);
+  const trimmedQuery = query.trim();
 
-  const handleRemoveFriend = async (friendId: string) => {
-    setMenuFriendId(null);
-    await apiFetch(`/api/friends/${friendId}`, { method: 'DELETE' }).catch(() => {});
-    onRefreshAll();
-  };
+  useEffect(() => {
+    if (trimmedQuery.length < 2) {
+      setSearchResults([]);
+      setSearching(false);
+      setSearchError(null);
+      return;
+    }
 
-  const handleBlockFriend = async (friendId: string) => {
-    setMenuFriendId(null);
+    let cancelled = false;
+    setSearching(true);
+    setSearchError(null);
+    const timer = window.setTimeout(async () => {
+      try {
+        const res = await apiFetch<{ results: PublicUser[] }>(
+          `/api/users/search?q=${encodeURIComponent(trimmedQuery)}`
+        );
+        if (!cancelled) {
+          setSearchResults(res.results || []);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setSearchError(err instanceof Error ? err.message : 'Search failed.');
+        }
+      } finally {
+        if (!cancelled) {
+          setSearching(false);
+        }
+      }
+    }, 220);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [trimmedQuery]);
+
+  const handleBlockUser = async (userId: string) => {
+    setMenuUserId(null);
     await apiFetch('/api/blocks', {
       method: 'POST',
-      body: JSON.stringify({ userId: friendId }),
+      body: JSON.stringify({ userId }),
     }).catch(() => {});
     onRefreshAll();
   };
@@ -86,275 +124,294 @@ export const HomeTab: React.FC<HomeTabProps> = ({
     setTimeout(() => setActionMsg(null), 3000);
   };
 
-  return (
-    <div className="space-y-6">
-      {/* Quick Search & Action Strip */}
-      <div className="rounded-3xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 sm:p-5 space-y-4 shadow-sm">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-          <div className="relative flex-1">
-            <Search className="pointer-events-none absolute start-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-            <input
-              type="text"
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              placeholder={t('searchPlaceholder')}
-              className="w-full min-h-[48px] rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 ps-10 pe-4 text-sm sm:text-base text-slate-900 dark:text-white focus:border-teal-600 focus:outline-none"
-            />
+  const renderPersonRow = (
+    peer: PublicUser,
+    subtitleNode: React.ReactNode,
+    timeLabel?: string,
+    unreadCount = 0
+  ) => (
+    <div
+      key={peer.id}
+      className="relative flex flex-wrap items-center justify-between gap-3 py-3.5 first:pt-0 last:pb-0"
+    >
+      <button
+        type="button"
+        onClick={() => onOpenChat(peer)}
+        className="flex flex-1 items-center gap-3.5 min-w-0 text-start"
+      >
+        <Avatar
+          src={peer.avatarUrl}
+          name={peer.displayName || peer.phoneE164 || 'User'}
+          size="md"
+          online={peer.showOnlineStatus ? peer.online : undefined}
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-2">
+            <p className="font-display text-base font-bold text-slate-900 dark:text-white truncate">
+              {peer.displayName || peer.phoneE164}
+            </p>
+            {timeLabel && (
+              <span className="text-[11px] text-slate-400 dark:text-slate-500 shrink-0 tabular-nums">
+                {timeLabel}
+              </span>
+            )}
           </div>
-
-          <div className="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              onClick={onOpenQr}
-              className="inline-flex min-h-[48px] flex-1 sm:flex-initial items-center justify-center gap-2 rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-4 text-sm font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-700 whitespace-nowrap"
-            >
-              <QrCode className="h-4 w-4 text-teal-700 dark:text-teal-400" />
-              {t('scanQr')}
-            </button>
-            <button
-              type="button"
-              onClick={onOpenContacts}
-              className="inline-flex min-h-[48px] flex-1 sm:flex-initial items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-teal-700 to-emerald-700 px-4 text-sm font-semibold text-white hover:from-teal-800 hover:to-emerald-800 shadow-xs whitespace-nowrap"
-            >
-              <Users className="h-4 w-4" />
-              {t('syncContacts')}
-            </button>
+          <div className="mt-0.5 flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 min-w-0">
+            <div className="truncate flex items-center gap-1.5 min-w-0">{subtitleNode}</div>
+            {unreadCount > 0 && (
+              <span className="inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-teal-600 px-1.5 text-[10px] font-bold text-white shrink-0">
+                {unreadCount}
+              </span>
+            )}
           </div>
         </div>
+      </button>
 
-        {incomingRequests.length > 0 && (
+      <div className="flex items-center gap-1.5 shrink-0">
+        <button
+          type="button"
+          onClick={() => onStartCall(peer, 'audio')}
+          aria-label={`${t('audioCall')} ${peer.displayName}`}
+          title={t('audioCall')}
+          className="inline-flex min-h-[42px] min-w-[42px] items-center justify-center gap-1.5 rounded-xl bg-gradient-to-r from-teal-700 to-emerald-700 px-3 text-sm font-semibold text-white hover:from-teal-800 hover:to-emerald-800 shadow-xs transition-all"
+        >
+          <Phone className="h-4 w-4" />
+          <span className="hidden sm:inline">{t('audioCall')}</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => onStartCall(peer, 'video')}
+          aria-label={`${t('videoCall')} ${peer.displayName}`}
+          title={t('videoCall')}
+          className="inline-flex min-h-[42px] min-w-[42px] items-center justify-center gap-1.5 rounded-xl bg-slate-900 dark:bg-slate-700 px-3 text-sm font-semibold text-white hover:bg-slate-800 dark:hover:bg-slate-600 shadow-xs transition-all"
+        >
+          <Video className="h-4 w-4" />
+          <span className="hidden sm:inline">{t('videoCall')}</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => onOpenChat(peer)}
+          aria-label={`${t('message')} ${peer.displayName}`}
+          title={t('message')}
+          className="flex min-h-[42px] min-w-[42px] items-center justify-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
+        >
+          <MessageSquare className="h-4 w-4" />
+        </button>
+
+        <div className="relative">
           <button
             type="button"
-            onClick={onOpenContacts}
-            className="flex w-full min-h-[48px] items-center justify-between rounded-2xl border border-teal-200 dark:border-teal-900 bg-teal-50 dark:bg-teal-950/40 px-4 py-3 text-start hover:bg-teal-100/70 dark:hover:bg-teal-950/60 transition-colors"
+            onClick={() => setMenuUserId((prev) => (prev === peer.id ? null : peer.id))}
+            aria-label="More options"
+            className="flex min-h-[42px] min-w-[36px] items-center justify-center rounded-xl text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
           >
-            <span className="flex items-center gap-2.5 text-sm font-semibold text-teal-900 dark:text-teal-200">
-              <UserPlus className="h-5 w-5 text-teal-700 dark:text-teal-400" />
-              {t('friendRequests')} ({incomingRequests.length})
-            </span>
-            <span className="text-xs font-semibold text-teal-700 dark:text-teal-300">Review</span>
+            <MoreVertical className="h-4 w-4" />
           </button>
-        )}
+
+          {menuUserId === peer.id && (
+            <div className="absolute end-0 z-20 mt-1 w-44 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-1.5 shadow-xl">
+              <button
+                type="button"
+                onClick={() => {
+                  setMenuUserId(null);
+                  setReportTarget(peer);
+                }}
+                className="flex w-full min-h-[40px] items-center gap-2 rounded-xl px-3 text-start text-sm text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/40"
+              >
+                <Flag className="h-4 w-4" />
+                {t('reportUser')}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleBlockUser(peer.id)}
+                className="flex w-full min-h-[40px] items-center gap-2 rounded-xl px-3 text-start text-sm text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40"
+              >
+                <ShieldAlert className="h-4 w-4" />
+                {t('blockUser')}
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="space-y-4">
+      {/* Top Search Bar Only */}
+      <div className="rounded-3xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 sm:p-4 shadow-sm">
+        <div className="relative">
+          <Search className="pointer-events-none absolute start-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search phone number or name (e.g. 01833320066)..."
+            className="w-full min-h-[48px] rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 ps-10 pe-10 text-sm sm:text-base text-slate-900 dark:text-white focus:border-teal-600 focus:outline-none"
+          />
+          {query && (
+            <button
+              type="button"
+              onClick={() => setQuery('')}
+              aria-label="Clear search"
+              className="absolute end-2.5 top-1/2 -translate-y-1/2 flex h-8 w-8 items-center justify-center rounded-full text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          )}
+        </div>
 
         {actionMsg && (
-          <p className="rounded-xl bg-teal-50 dark:bg-teal-950/40 px-4 py-2 text-sm text-teal-800 dark:text-teal-200">
+          <p className="mt-3 rounded-xl bg-teal-50 dark:bg-teal-950/40 px-4 py-2 text-sm text-teal-800 dark:text-teal-200">
             {actionMsg}
           </p>
         )}
       </div>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-        {/* Primary Friends List */}
-        <section className="lg:col-span-8 rounded-3xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 sm:p-6 shadow-sm">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="font-display text-xl font-bold text-slate-900 dark:text-white">
-              {t('friendsTitle')} ({friends.length})
-            </h2>
-          </div>
+      {/* Live Search Results */}
+      {trimmedQuery.length >= 2 ? (
+        <section className="rounded-3xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 sm:p-5 shadow-sm">
+          <h2 className="font-display text-base font-bold text-slate-900 dark:text-white mb-3">
+            Search Results
+          </h2>
+          {searching ? (
+            <div className="flex items-center justify-center gap-2 py-8 text-sm text-slate-500 dark:text-slate-400">
+              <Loader2 className="h-4 w-4 animate-spin text-teal-600" />
+              <span>Searching accounts...</span>
+            </div>
+          ) : searchError ? (
+            <p className="py-6 text-center text-sm text-rose-600 dark:text-rose-400">
+              {searchError}
+            </p>
+          ) : searchResults.length === 0 ? (
+            <div className="py-8 text-center space-y-1.5">
+              <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">
+                No account found for "{trimmedQuery}"
+              </p>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Make sure that person has signed in on this server with their mobile number.
+              </p>
+            </div>
+          ) : (
+            <div className="divide-y divide-slate-100 dark:divide-slate-800">
+              {searchResults.map((person) =>
+                renderPersonRow(
+                  person,
+                  <>
+                    <span className="font-mono text-slate-600 dark:text-slate-300">
+                      {person.phoneE164 || person.countryIso}
+                    </span>
+                    {person.showOnlineStatus && (
+                      <span>· {person.online ? t('online') : t('offline')}</span>
+                    )}
+                  </>
+                )
+              )}
+            </div>
+          )}
+        </section>
+      ) : (
+        /* imo-style Call History & Recent Chats Feed */
+        <section className="rounded-3xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 sm:p-5 shadow-sm">
+          <h2 className="font-display text-lg font-bold text-slate-900 dark:text-white mb-4">
+            Recent Calls & Chats
+          </h2>
 
-          {visibleFriends.length === 0 ? (
-            <div className="py-12 text-center space-y-3">
+          {homeFeed.length === 0 && recentCalls.length === 0 ? (
+            <div className="py-12 text-center space-y-2">
               <p className="font-display text-base font-semibold text-slate-800 dark:text-slate-200">
-                {t('noFriendsYet')}
+                No calls or chats yet
               </p>
               <p className="mx-auto max-w-sm text-sm text-slate-500 dark:text-slate-400">
-                {t('noFriendsHint')}
+                উপরের সার্চ বারে মোবাইল নাম্বার বা নাম লিখে খুঁজুন এবং সরাসরি অডিও, ভিডিও কল বা মেসেজ করুন।
               </p>
-              <div className="pt-2 flex justify-center gap-3">
-                <button
-                  type="button"
-                  onClick={onOpenContacts}
-                  className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-gradient-to-r from-teal-700 to-emerald-700 px-5 py-2.5 text-sm font-semibold text-white hover:from-teal-800 hover:to-emerald-800 shadow-xs"
-                >
-                  <UserPlus className="h-4 w-4" />
-                  {t('sendRequest')}
-                </button>
-              </div>
             </div>
-          ) : (
+          ) : homeFeed.length > 0 ? (
             <div className="divide-y divide-slate-100 dark:divide-slate-800">
-              {visibleFriends.map((friend) => (
-                <div
-                  key={friend.id}
-                  className="relative flex flex-wrap items-center justify-between gap-3 py-4 first:pt-0 last:pb-0"
-                >
-                  <div className="flex items-center gap-3.5 min-w-0">
-                    <Avatar
-                      src={friend.avatarUrl}
-                      name={friend.displayName}
-                      size="md"
-                      online={friend.showOnlineStatus ? friend.online : undefined}
-                    />
-                    <div className="min-w-0">
-                      <p className="font-display text-base font-bold text-slate-900 dark:text-white truncate">
-                        {friend.displayName}
-                      </p>
-                      <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                        {friend.showOnlineStatus
-                          ? friend.online
-                            ? t('online')
-                            : t('offline')
-                          : friend.countryIso}
-                        {friend.bio ? ` · ${friend.bio}` : ''}
-                      </p>
-                    </div>
-                  </div>
+              {homeFeed.map((item) => {
+                const { peer, lastCall, lastMessage, lastActivityAt, unreadCount } = item;
+                const callNewer =
+                  lastCall && (!lastMessage || lastCall.startedAt >= lastMessage.createdAt);
 
-                  {/* Large accessible Audio, Video, Chat & More buttons */}
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => onStartCall(friend, 'audio')}
-                      aria-label={`${t('audioCall')} ${friend.displayName}`}
-                      title={t('audioCall')}
-                      className="inline-flex min-h-[44px] items-center gap-1.5 rounded-xl bg-gradient-to-r from-teal-700 to-emerald-700 px-3.5 py-2 text-sm font-semibold text-white hover:from-teal-800 hover:to-emerald-800 shadow-xs transition-all"
-                    >
-                      <Phone className="h-4 w-4" />
-                      <span className="hidden sm:inline">{t('audioCall')}</span>
-                    </button>
+                let subtitle: React.ReactNode = (
+                  <span>{peer.phoneE164 || peer.countryIso}</span>
+                );
 
-                    <button
-                      type="button"
-                      onClick={() => onStartCall(friend, 'video')}
-                      aria-label={`${t('videoCall')} ${friend.displayName}`}
-                      title={t('videoCall')}
-                      className="inline-flex min-h-[44px] items-center gap-1.5 rounded-xl bg-slate-900 dark:bg-slate-700 px-3.5 py-2 text-sm font-semibold text-white hover:bg-slate-800 dark:hover:bg-slate-600 shadow-xs transition-all"
-                    >
-                      <Video className="h-4 w-4" />
-                      <span className="hidden sm:inline">{t('videoCall')}</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => onOpenChat(friend)}
-                      aria-label={`${t('message')} ${friend.displayName}`}
-                      title={t('message')}
-                      className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
-                    >
-                      <MessageSquare className="h-5 w-5" />
-                    </button>
-
-                    <div className="relative">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setMenuFriendId((prev) => (prev === friend.id ? null : friend.id))
-                        }
-                        aria-label="More options"
-                        className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
-                      >
-                        <MoreVertical className="h-5 w-5" />
-                      </button>
-
-                      {menuFriendId === friend.id && (
-                        <div className="absolute end-0 z-20 mt-1 w-48 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-1.5 shadow-xl">
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveFriend(friend.id)}
-                            className="flex w-full min-h-[40px] items-center gap-2 rounded-xl px-3 text-start text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
-                          >
-                            <UserMinus className="h-4 w-4" />
-                            {t('removeFriend')}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setMenuFriendId(null);
-                              setReportTarget(friend);
-                            }}
-                            className="flex w-full min-h-[40px] items-center gap-2 rounded-xl px-3 text-start text-sm text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/40"
-                          >
-                            <Flag className="h-4 w-4" />
-                            {t('reportUser')}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleBlockFriend(friend.id)}
-                            className="flex w-full min-h-[40px] items-center gap-2 rounded-xl px-3 text-start text-sm text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40"
-                          >
-                            <ShieldAlert className="h-4 w-4" />
-                            {t('blockUser')}
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </section>
-
-        {/* Recent Calls Column */}
-        <section className="lg:col-span-4 rounded-3xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 sm:p-6">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="font-display text-lg font-bold text-slate-900 dark:text-white">
-              {t('navCalls')}
-            </h2>
-            {recentCalls.length > 0 && (
-              <button
-                type="button"
-                onClick={onOpenCalls}
-                className="text-xs font-semibold text-teal-700 dark:text-teal-400 hover:underline"
-              >
-                View all
-              </button>
-            )}
-          </div>
-
-          {recentCalls.length === 0 ? (
-            <p className="py-8 text-center text-sm text-slate-500 dark:text-slate-400">
-              {t('noCallsYet')}
-            </p>
-          ) : (
-            <div className="divide-y divide-slate-100 dark:divide-slate-800">
-              {recentCalls.slice(0, 5).map((c) => (
-                <div key={c.id} className="flex items-center justify-between gap-2 py-3 first:pt-0 last:pb-0">
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <Avatar src={c.peerAvatarUrl} name={c.peerName} size="sm" />
-                    <div className="min-w-0">
-                      <p className="text-sm font-semibold text-slate-900 dark:text-white truncate">
-                        {c.peerName}
-                      </p>
-                      <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-                        {c.direction} · {c.status}
-                      </p>
-                    </div>
-                  </div>
-                  {c.canCallback && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        onStartCall(
-                          {
-                            id: c.peerId,
-                            displayName: c.peerName,
-                            avatarUrl: c.peerAvatarUrl,
-                            countryIso: c.peerCountryIso,
-                            countryCode: '',
-                            bio: '',
-                            qrToken: '',
-                            lastSeenAt: c.startedAt,
-                          },
-                          c.callType
-                        )
-                      }
-                      aria-label={t('callBack')}
-                      className="flex min-h-[40px] min-w-[40px] items-center justify-center rounded-xl text-teal-700 dark:text-teal-400 hover:bg-teal-50 dark:hover:bg-teal-950/40"
-                    >
-                      {c.callType === 'video' ? (
-                        <Video className="h-4 w-4" />
+                if (callNewer && lastCall) {
+                  const isMissed = lastCall.status === 'missed' || lastCall.status === 'rejected';
+                  const dur = formatDuration(lastCall.durationSec);
+                  subtitle = (
+                    <>
+                      {isMissed ? (
+                        <PhoneMissed className="h-3.5 w-3.5 text-rose-500 shrink-0" />
+                      ) : lastCall.direction === 'incoming' ? (
+                        <PhoneIncoming className="h-3.5 w-3.5 text-emerald-600 shrink-0" />
                       ) : (
-                        <Phone className="h-4 w-4" />
+                        <PhoneOutgoing className="h-3.5 w-3.5 text-teal-600 shrink-0" />
                       )}
-                    </button>
-                  )}
-                </div>
-              ))}
+                      <span className={isMissed ? 'text-rose-600 dark:text-rose-400 font-medium' : ''}>
+                        {lastCall.callType === 'video' ? 'Video call' : 'Audio call'} ·{' '}
+                        {isMissed ? 'Missed' : dur || lastCall.status}
+                      </span>
+                    </>
+                  );
+                } else if (lastMessage) {
+                  subtitle = (
+                    <span className="truncate">
+                      {lastMessage.hasImage && !lastMessage.body
+                        ? '📷 Photo'
+                        : lastMessage.body}
+                    </span>
+                  );
+                }
+
+                return renderPersonRow(
+                  peer,
+                  subtitle,
+                  formatShortTime(lastActivityAt),
+                  unreadCount
+                );
+              })}
+            </div>
+          ) : (
+            <div className="divide-y divide-slate-100 dark:divide-slate-800">
+              {recentCalls.map((c) => {
+                const peerObj: PublicUser = {
+                  id: c.peerId,
+                  displayName: c.peerName,
+                  avatarUrl: c.peerAvatarUrl,
+                  countryIso: c.peerCountryIso,
+                  countryCode: '',
+                  bio: '',
+                  qrToken: '',
+                  lastSeenAt: c.startedAt,
+                };
+                const isMissed = c.status === 'missed' || c.status === 'rejected';
+                const dur = formatDuration(c.durationSec);
+                return renderPersonRow(
+                  peerObj,
+                  <>
+                    {isMissed ? (
+                      <PhoneMissed className="h-3.5 w-3.5 text-rose-500 shrink-0" />
+                    ) : c.direction === 'incoming' ? (
+                      <PhoneIncoming className="h-3.5 w-3.5 text-emerald-600 shrink-0" />
+                    ) : (
+                      <PhoneOutgoing className="h-3.5 w-3.5 text-teal-600 shrink-0" />
+                    )}
+                    <span className={isMissed ? 'text-rose-600 dark:text-rose-400 font-medium' : ''}>
+                      {c.callType === 'video' ? 'Video call' : 'Audio call'} ·{' '}
+                      {isMissed ? 'Missed' : dur || c.status}
+                    </span>
+                  </>,
+                  formatShortTime(c.startedAt)
+                );
+              })}
             </div>
           )}
         </section>
-      </div>
+      )}
 
       {/* Report Modal */}
       {reportTarget && (
