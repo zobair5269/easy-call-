@@ -1,4 +1,4 @@
-import type { IncomingMessage, Server as HttpServer } from 'node:http';
+import type { IncomingMessage, Server as HttpServer, ServerResponse } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
   db,
@@ -10,24 +10,84 @@ import {
 import { hashWithServerSecret } from './security.ts';
 
 const userSockets = new Map<string, Set<WebSocket>>();
+const backgroundStreams = new Map<string, Set<ServerResponse>>();
 const ringTimeouts = new Map<string, NodeJS.Timeout>();
 
+const BG_EVENT_TYPES = new Set([
+  'call:incoming',
+  'call:ended',
+  'call:rejected',
+  'chat:message',
+  'friend_request:new',
+  'friend_request:accepted',
+]);
+
 export function isUserOnline(userId: string): boolean {
-  const set = userSockets.get(userId);
-  return Boolean(set && set.size > 0);
+  const wsSet = userSockets.get(userId);
+  if (wsSet && wsSet.size > 0) return true;
+  const bgSet = backgroundStreams.get(userId);
+  return Boolean(bgSet && bgSet.size > 0);
+}
+
+export function registerBackgroundStream(userId: string, res: ServerResponse): void {
+  let set = backgroundStreams.get(userId);
+  const wasOffline = !isUserOnline(userId);
+  if (!set) {
+    set = new Set<ServerResponse>();
+    backgroundStreams.set(userId, set);
+  }
+  set.add(res);
+  db.prepare('UPDATE users SET last_seen_at = ? WHERE id = ?').run(Date.now(), userId);
+  if (wasOffline) {
+    broadcastPresenceToFriends(userId, true);
+  }
+}
+
+export function unregisterBackgroundStream(userId: string, res: ServerResponse): void {
+  const set = backgroundStreams.get(userId);
+  if (!set) return;
+  set.delete(res);
+  if (set.size === 0) {
+    backgroundStreams.delete(userId);
+    if (!isUserOnline(userId)) {
+      db.prepare('UPDATE users SET last_seen_at = ? WHERE id = ?').run(Date.now(), userId);
+      broadcastPresenceToFriends(userId, false);
+    }
+  }
 }
 
 export function sendToUser(userId: string, payload: unknown): boolean {
-  const sockets = userSockets.get(userId);
-  if (!sockets || sockets.size === 0) return false;
   const serialized = JSON.stringify(payload);
   let sent = false;
-  for (const ws of sockets) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(serialized);
-      sent = true;
+
+  const sockets = userSockets.get(userId);
+  if (sockets && sockets.size > 0) {
+    for (const ws of sockets) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(serialized);
+        sent = true;
+      }
     }
   }
+
+  const eventType =
+    typeof payload === 'object' && payload !== null && 'type' in payload
+      ? String((payload as { type: unknown }).type)
+      : '';
+
+  if (BG_EVENT_TYPES.has(eventType)) {
+    const bgSet = backgroundStreams.get(userId);
+    if (bgSet && bgSet.size > 0) {
+      const sseFrame = `data: ${serialized}\n\n`;
+      for (const res of bgSet) {
+        if (!res.writableEnded) {
+          res.write(sseFrame);
+          sent = true;
+        }
+      }
+    }
+  }
+
   return sent;
 }
 
@@ -83,6 +143,32 @@ function clearRingTimeout(callId: string) {
   }
 }
 
+export function rejectIncomingCallById(callId: string, userId: string): boolean {
+  const call = db
+    .prepare('SELECT * FROM call_records WHERE id = ? AND callee_id = ?')
+    .get(callId, userId) as
+    | { id: string; caller_id: string; callee_id: string; status: string }
+    | undefined;
+  if (!call || call.status !== 'ringing') return false;
+
+  clearRingTimeout(callId);
+  db.prepare(
+    `UPDATE call_records SET status = 'rejected', ended_at = ? WHERE id = ?`
+  ).run(Date.now(), callId);
+
+  sendToUser(call.caller_id, {
+    type: 'call:rejected',
+    callId,
+    byUserId: userId,
+  });
+  sendToUser(call.callee_id, {
+    type: 'call:ended',
+    callId,
+    reason: 'rejected',
+  });
+  return true;
+}
+
 export function initWebSocketServer(httpServer: HttpServer) {
   const wss = new WebSocketServer({ noServer: true });
 
@@ -104,7 +190,7 @@ export function initWebSocketServer(httpServer: HttpServer) {
 
     const registerSocket = (userId: string) => {
       let set = userSockets.get(userId);
-      const wasOffline = !set || set.size === 0;
+      const wasOffline = !isUserOnline(userId);
       if (!set) {
         set = new Set<WebSocket>();
         userSockets.set(userId, set);
@@ -287,23 +373,7 @@ export function initWebSocketServer(httpServer: HttpServer) {
 
       if (msg.type === 'call:reject') {
         const callId = typeof msg.callId === 'string' ? msg.callId : '';
-        const call = db
-          .prepare('SELECT * FROM call_records WHERE id = ? AND callee_id = ?')
-          .get(callId, userId) as
-          | { id: string; caller_id: string; callee_id: string; status: string }
-          | undefined;
-        if (!call || call.status !== 'ringing') return;
-
-        clearRingTimeout(callId);
-        db.prepare(
-          `UPDATE call_records SET status = 'rejected', ended_at = ? WHERE id = ?`
-        ).run(Date.now(), callId);
-
-        sendToUser(call.caller_id, {
-          type: 'call:rejected',
-          callId,
-          byUserId: userId,
-        });
+        rejectIncomingCallById(callId, userId);
         return;
       }
 
@@ -370,7 +440,9 @@ export function initWebSocketServer(httpServer: HttpServer) {
         msg.type === 'webrtc:offer' ||
         msg.type === 'webrtc:answer' ||
         msg.type === 'webrtc:ice-candidate' ||
-        msg.type === 'webrtc:media-state'
+        msg.type === 'webrtc:media-state' ||
+        msg.type === 'relay:audio' ||
+        msg.type === 'relay:video'
       ) {
         const callId = typeof msg.callId === 'string' ? msg.callId : '';
         const targetUserId = typeof msg.targetUserId === 'string' ? msg.targetUserId : '';
@@ -414,11 +486,13 @@ export function initWebSocketServer(httpServer: HttpServer) {
         set.delete(ws);
         if (set.size === 0) {
           userSockets.delete(authedUserId);
-          db.prepare('UPDATE users SET last_seen_at = ? WHERE id = ?').run(
-            Date.now(),
-            authedUserId
-          );
-          broadcastPresenceToFriends(authedUserId, false);
+          if (!isUserOnline(authedUserId)) {
+            db.prepare('UPDATE users SET last_seen_at = ? WHERE id = ?').run(
+              Date.now(),
+              authedUserId
+            );
+            broadcastPresenceToFriends(authedUserId, false);
+          }
         }
       }
     });

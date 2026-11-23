@@ -12,6 +12,7 @@ import {
   Wifi,
 } from 'lucide-react';
 import { translate, type TranslationKeys } from '../i18n/translations';
+import { hasNativeAndroidBridge } from '../lib/nativeBridge';
 import type { PublicUser } from '../types/app';
 import { Avatar } from './Avatar';
 
@@ -35,6 +36,7 @@ interface CallOverlayProps {
   dataSaver: boolean;
   durationSec: number;
   mediaError: string | null;
+  relayVideoFrame?: string | null;
   onAccept: () => void;
   onReject: () => void;
   onEnd: () => void;
@@ -61,6 +63,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   dataSaver,
   durationSec,
   mediaError,
+  relayVideoFrame,
   onAccept,
   onReject,
   onEnd,
@@ -73,20 +76,35 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const isNative = hasNativeAndroidBridge();
 
   useEffect(() => {
-    if (remoteVideoRef.current && remoteStream) {
-      remoteVideoRef.current.srcObject = remoteStream;
-      remoteVideoRef.current.muted = true;
-      remoteVideoRef.current.play().catch(() => {});
-    }
-    if (remoteAudioRef.current && remoteStream) {
-      remoteAudioRef.current.srcObject = remoteStream;
-      remoteAudioRef.current.muted = !speakerOn;
-      remoteAudioRef.current.volume = 1;
-      remoteAudioRef.current.play().catch(() => {});
-    }
-  }, [remoteStream, speakerOn, session?.callId]);
+    const syncRemotePlayback = () => {
+      if (remoteVideoRef.current && remoteStream) {
+        if (remoteVideoRef.current.srcObject !== remoteStream) {
+          remoteVideoRef.current.srcObject = remoteStream;
+        }
+        remoteVideoRef.current.muted = true;
+        remoteVideoRef.current.play().catch(() => {});
+      }
+      if (remoteAudioRef.current && remoteStream) {
+        if (remoteAudioRef.current.srcObject !== remoteStream) {
+          remoteAudioRef.current.srcObject = remoteStream;
+        }
+        remoteAudioRef.current.muted = isNative ? false : !speakerOn;
+        remoteAudioRef.current.volume = 1;
+        remoteAudioRef.current.play().catch(() => {});
+      }
+    };
+
+    syncRemotePlayback();
+    if (!remoteStream) return;
+
+    remoteStream.addEventListener('addtrack', syncRemotePlayback);
+    return () => {
+      remoteStream.removeEventListener('addtrack', syncRemotePlayback);
+    };
+  }, [remoteStream, speakerOn, session?.callId, isNative]);
 
   useEffect(() => {
     if (localVideoRef.current && localStream) {
@@ -98,6 +116,8 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   if (!session) return null;
 
   const isVideo = session.callType === 'video';
+  const hasWebRtcVideo = Boolean(remoteStream && remoteStream.getVideoTracks().length > 0);
+  const hasRemoteVideo = isVideo && (hasWebRtcVideo || Boolean(relayVideoFrame));
   const statusLabel =
     session.phase === 'ringing'
       ? session.direction === 'incoming'
@@ -115,16 +135,22 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
         ref={remoteAudioRef}
         autoPlay
         playsInline
-        className="pointer-events-none fixed -left-[9999px] h-px w-px opacity-0"
+        className="sr-only"
       />
 
       {/* Remote Video Background (when video call is active) */}
-      {isVideo && remoteStream ? (
+      {isVideo && hasWebRtcVideo ? (
         <video
           ref={remoteVideoRef}
           autoPlay
           playsInline
           muted
+          className="absolute inset-0 h-full w-full object-cover"
+        />
+      ) : isVideo && relayVideoFrame ? (
+        <img
+          src={relayVideoFrame}
+          alt={session.peer.displayName}
           className="absolute inset-0 h-full w-full object-cover"
         />
       ) : null}
@@ -146,7 +172,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
         </div>
 
         <div className="mt-6 flex flex-col items-center gap-3">
-          {(!isVideo || session.phase !== 'connected' || !remoteStream) && (
+          {(!isVideo || session.phase !== 'connected' || !hasRemoteVideo) && (
             <Avatar src={session.peer.avatarUrl} name={session.peer.displayName} size="xl" />
           )}
           <h2 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-white">

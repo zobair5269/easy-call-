@@ -13,7 +13,16 @@ import { QrModal } from './components/QrModal';
 import { WelcomeAuth } from './components/WelcomeAuth';
 import { detectDeviceLanguage, getLanguageMeta, translate, type TranslationKeys } from './i18n/translations';
 import { apiFetch, buildWsUrl, getAuthToken, initApiConfig, resolveApiUrl, setAuthToken } from './lib/api';
+import {
+  clearNativeSessionAuth,
+  hasNativeAndroidBridge,
+  setNativeCallAudioMode,
+  setNativeSpeakerphone,
+  stopNativeRinging,
+  syncNativeSessionAuth,
+} from './lib/nativeBridge';
 import { ringtone } from './lib/ringtone';
+import { WssMediaRelay } from './lib/wssMediaRelay';
 import type {
   ActiveTab,
   AppNotification,
@@ -93,10 +102,21 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const pendingOfferRef = useRef<{ callId: string; fromUserId: string; sdp: RTCSessionDescriptionInit } | null>(null);
   const callSessionRef = useRef<ActiveCallSession | null>(null);
   const iceServersRef = useRef<RTCIceServer[]>([{ urls: 'stun:stun.l.google.com:19302' }]);
+  const relayRef = useRef<WssMediaRelay | null>(null);
+  const relayFallbackTimerRef = useRef<number | null>(null);
+  const relayActiveRef = useRef(false);
+  const pendingOutIceRef = useRef<
+    Array<{ callId: string; targetUserId: string; candidate: RTCIceCandidateInit }>
+  >([]);
+  const mutedRef = useRef(false);
+  const cameraOffRef = useRef(false);
+  const speakerOnRef = useRef(true);
+  const dataSaverRef = useRef(false);
 
   const [callSession, setCallSession] = useState<ActiveCallSession | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [relayVideoFrame, setRelayVideoFrame] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
   const [cameraOff, setCameraOff] = useState(false);
   const [speakerOn, setSpeakerOn] = useState(true);
@@ -193,8 +213,25 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   }, [user]);
 
   useEffect(() => {
+    mutedRef.current = muted;
+  }, [muted]);
+
+  useEffect(() => {
+    cameraOffRef.current = cameraOff;
+  }, [cameraOff]);
+
+  useEffect(() => {
+    speakerOnRef.current = speakerOn;
+  }, [speakerOn]);
+
+  useEffect(() => {
+    dataSaverRef.current = Boolean(user?.dataSaver);
+  }, [user?.dataSaver]);
+
+  useEffect(() => {
     if (user) {
       refreshAllData();
+      syncNativeSessionAuth(resolveApiUrl(''), getAuthToken() || '', user.id);
       const tok = getAuthToken();
       fetch(resolveApiUrl('/api/admin/status'), {
         headers: tok ? { 'X-User-Token': tok } : {},
@@ -212,8 +249,69 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     }
   }, [user, refreshAllData]);
 
+  const checkPendingIncomingCall = useCallback(async () => {
+    if (!user || callSessionRef.current) return;
+    try {
+      const res = await apiFetch<{
+        incoming: {
+          callId: string;
+          callType: 'audio' | 'video';
+          startedAt: number;
+          caller: PublicUser;
+        } | null;
+      }>('/api/calls/active-incoming');
+      if (res.incoming && !callSessionRef.current) {
+        const inc = res.incoming;
+        if (!hasNativeAndroidBridge()) {
+          ringtone.startIncoming();
+        }
+        const nextSession: ActiveCallSession = {
+          callId: inc.callId,
+          direction: 'incoming',
+          callType: inc.callType,
+          peer: inc.caller,
+          phase: 'ringing',
+          startedAt: inc.startedAt || Date.now(),
+        };
+        callSessionRef.current = nextSession;
+        setCallSession(nextSession);
+      }
+    } catch {
+      // Ignore transient check errors
+    }
+  }, [user]);
+
+  useEffect(() => {
+    if (!user) return;
+    checkPendingIncomingCall();
+    const onVisibleOrResume = () => {
+      if (document.visibilityState !== 'hidden') {
+        refreshAllData();
+        checkPendingIncomingCall();
+      }
+    };
+    window.addEventListener('easycall:resume', onVisibleOrResume);
+    document.addEventListener('visibilitychange', onVisibleOrResume);
+    return () => {
+      window.removeEventListener('easycall:resume', onVisibleOrResume);
+      document.removeEventListener('visibilitychange', onVisibleOrResume);
+    };
+  }, [user, refreshAllData, checkPendingIncomingCall]);
+
   const cleanupCallMedia = useCallback(() => {
     ringtone.stop();
+    stopNativeRinging();
+    setNativeCallAudioMode(false, false);
+    if (relayFallbackTimerRef.current !== null) {
+      window.clearTimeout(relayFallbackTimerRef.current);
+      relayFallbackTimerRef.current = null;
+    }
+    if (relayRef.current) {
+      relayRef.current.stop();
+      relayRef.current = null;
+    }
+    relayActiveRef.current = false;
+    pendingOutIceRef.current = [];
     if (pcRef.current) {
       pcRef.current.onicecandidate = null;
       pcRef.current.ontrack = null;
@@ -229,8 +327,10 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     remoteStreamRef.current = null;
     pendingIceRef.current = [];
     pendingOfferRef.current = null;
+    callSessionRef.current = null;
     setLocalStream(null);
     setRemoteStream(null);
+    setRelayVideoFrame(null);
     setCallSession(null);
     setMuted(false);
     setCameraOff(false);
@@ -284,8 +384,90 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     [user?.dataSaver]
   );
 
+  const activateMediaRelay = useCallback(
+    (callId: string, targetUserId: string, callType: 'audio' | 'video') => {
+      if (relayActiveRef.current || !callSessionRef.current || callSessionRef.current.callId !== callId) {
+        return;
+      }
+      relayActiveRef.current = true;
+      if (relayFallbackTimerRef.current !== null) {
+        window.clearTimeout(relayFallbackTimerRef.current);
+        relayFallbackTimerRef.current = null;
+      }
+      ringtone.stop();
+      stopNativeRinging();
+      setNativeCallAudioMode(true, speakerOnRef.current);
+
+      const relay = new WssMediaRelay();
+      relayRef.current = relay;
+      relay.start({
+        localStream: localStreamRef.current,
+        isVideo: callType === 'video',
+        dataSaver: dataSaverRef.current,
+        isMuted: () => mutedRef.current,
+        isCameraOff: () => cameraOffRef.current,
+        onSendAudio: (pcm, sr) => {
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(
+              JSON.stringify({
+                type: 'relay:audio',
+                callId,
+                targetUserId,
+                sr,
+                pcm,
+              })
+            );
+          }
+        },
+        onSendVideo: (jpg) => {
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(
+              JSON.stringify({
+                type: 'relay:video',
+                callId,
+                targetUserId,
+                jpg,
+              })
+            );
+          }
+        },
+      });
+      if (!hasNativeAndroidBridge()) {
+        relay.setOutputGain(speakerOnRef.current ? 1 : 0);
+      }
+
+      setCallSession((prev) =>
+        prev && prev.callId === callId && prev.phase !== 'connected'
+          ? { ...prev, phase: 'connected' }
+          : prev
+      );
+    },
+    []
+  );
+
+  const scheduleRelayFallback = useCallback(
+    (callId: string, targetUserId: string, callType: 'audio' | 'video') => {
+      if (relayFallbackTimerRef.current !== null) {
+        window.clearTimeout(relayFallbackTimerRef.current);
+      }
+      relayFallbackTimerRef.current = window.setTimeout(() => {
+        relayFallbackTimerRef.current = null;
+        const pc = pcRef.current;
+        const p2pConnected =
+          pc &&
+          (pc.connectionState === 'connected' ||
+            pc.iceConnectionState === 'connected' ||
+            pc.iceConnectionState === 'completed');
+        if (!p2pConnected && callSessionRef.current?.callId === callId) {
+          activateMediaRelay(callId, targetUserId, callType);
+        }
+      }, 4500);
+    },
+    [activateMediaRelay]
+  );
+
   const createPeerConnection = useCallback(
-    (callId: string, targetUserId: string) => {
+    (callId: string, targetUserId: string, callType: 'audio' | 'video', isCaller: boolean) => {
       const pc = new RTCPeerConnection({
         iceServers: iceServersRef.current,
         iceCandidatePoolSize: 4,
@@ -294,58 +476,106 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       remoteStreamRef.current = rStream;
       setRemoteStream(rStream);
 
+      const hasLocalAudio = Boolean(localStreamRef.current && localStreamRef.current.getAudioTracks().length > 0);
       if (localStreamRef.current) {
         for (const track of localStreamRef.current.getTracks()) {
           pc.addTrack(track, localStreamRef.current);
         }
       }
+      if (!hasLocalAudio) {
+        try {
+          pc.addTransceiver('audio', { direction: 'recvonly' });
+        } catch {
+          // Ignore if transceiver add unsupported
+        }
+      }
 
       pc.ontrack = (event) => {
+        let changed = false;
+        const existingIds = new Set(rStream.getTracks().map((t) => t.id));
         for (const stream of event.streams) {
           for (const track of stream.getTracks()) {
-            rStream.addTrack(track);
+            if (!existingIds.has(track.id)) {
+              rStream.addTrack(track);
+              existingIds.add(track.id);
+              changed = true;
+            }
           }
         }
-        if (event.track && !rStream.getTracks().includes(event.track)) {
+        if (event.track && !existingIds.has(event.track.id)) {
           rStream.addTrack(event.track);
+          changed = true;
         }
-        setRemoteStream(new MediaStream(rStream.getTracks()));
+        if (changed) {
+          setRemoteStream(new MediaStream(rStream.getTracks()));
+        }
       };
 
       pc.onicecandidate = (event) => {
-        if (event.candidate && wsRef.current?.readyState === WebSocket.OPEN) {
+        if (!event.candidate) return;
+        const cand = event.candidate.toJSON();
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
           wsRef.current.send(
             JSON.stringify({
               type: 'webrtc:ice-candidate',
               callId,
               targetUserId,
-              candidate: event.candidate.toJSON(),
+              candidate: cand,
             })
           );
+        } else {
+          pendingOutIceRef.current.push({ callId, targetUserId, candidate: cand });
         }
       };
 
-      const handleStateUpdate = (state: string) => {
-        if (state === 'connected' || state === 'completed') {
+      const handleStateUpdate = () => {
+        const connState = pc.connectionState;
+        const iceState = pc.iceConnectionState;
+
+        if (connState === 'connected' || iceState === 'completed' || (iceState === 'connected' && connState !== 'failed')) {
+          if (relayFallbackTimerRef.current !== null) {
+            window.clearTimeout(relayFallbackTimerRef.current);
+            relayFallbackTimerRef.current = null;
+          }
           ringtone.stop();
+          stopNativeRinging();
+          setNativeCallAudioMode(true, speakerOnRef.current);
+          if (relayActiveRef.current && connState === 'connected' && rStream.getTracks().length > 0) {
+            relayRef.current?.stop();
+            relayRef.current = null;
+            relayActiveRef.current = false;
+            setRelayVideoFrame(null);
+          }
           setCallSession((prev) => (prev ? { ...prev, phase: 'connected' } : prev));
-        } else if (state === 'disconnected' || state === 'failed') {
-          setCallSession((prev) => (prev ? { ...prev, phase: 'reconnecting' } : prev));
-          try {
-            pc.restartIce();
-          } catch {
-            // Ignore restartIce errors
+        } else if (connState === 'failed' || iceState === 'failed' || iceState === 'disconnected') {
+          if (!relayActiveRef.current) {
+            activateMediaRelay(callId, targetUserId, callType);
+          }
+          if (isCaller && wsRef.current?.readyState === WebSocket.OPEN) {
+            pc.createOffer({ iceRestart: true })
+              .then(async (offer) => {
+                await pc.setLocalDescription(offer);
+                wsRef.current?.send(
+                  JSON.stringify({
+                    type: 'webrtc:offer',
+                    callId,
+                    targetUserId,
+                    sdp: pc.localDescription,
+                  })
+                );
+              })
+              .catch(() => {});
           }
         }
       };
 
-      pc.onconnectionstatechange = () => handleStateUpdate(pc.connectionState);
-      pc.oniceconnectionstatechange = () => handleStateUpdate(pc.iceConnectionState);
+      pc.onconnectionstatechange = handleStateUpdate;
+      pc.oniceconnectionstatechange = handleStateUpdate;
 
       pcRef.current = pc;
       return pc;
     },
-    []
+    [activateMediaRelay]
   );
 
   // Connect & maintain WebSocket
@@ -376,6 +606,19 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
         if (msg.type === 'ws:ready') {
           setWsConnected(true);
+          if (pendingOutIceRef.current.length > 0 && ws.readyState === WebSocket.OPEN) {
+            const batch = pendingOutIceRef.current.splice(0);
+            for (const item of batch) {
+              ws.send(
+                JSON.stringify({
+                  type: 'webrtc:ice-candidate',
+                  callId: item.callId,
+                  targetUserId: item.targetUserId,
+                  candidate: item.candidate,
+                })
+              );
+            }
+          }
         } else if (msg.type === 'presence:update') {
           const uid = String(msg.userId);
           const online = Boolean(msg.online);
@@ -415,18 +658,22 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           const callType = msg.callType === 'video' ? 'video' : 'audio';
           const caller = msg.caller as PublicUser;
           if (callSessionRef.current) {
-            ws.send(JSON.stringify({ type: 'call:reject', callId }));
+            if (callSessionRef.current.callId !== callId) {
+              ws.send(JSON.stringify({ type: 'call:reject', callId }));
+            }
             return;
           }
           ringtone.startIncoming();
-          setCallSession({
+          const nextSession: ActiveCallSession = {
             callId,
             direction: 'incoming',
             callType,
             peer: caller,
             phase: 'ringing',
             startedAt: Date.now(),
-          });
+          };
+          callSessionRef.current = nextSession;
+          setCallSession(nextSession);
           if ('Notification' in window && Notification.permission === 'granted') {
             try {
               new Notification(`Incoming ${callType} call`, {
@@ -441,9 +688,12 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           const current = callSessionRef.current;
           if (!current || current.callId !== callId) return;
           ringtone.stop();
+          stopNativeRinging();
+          setNativeCallAudioMode(true, speakerOnRef.current);
           setCallSession((prev) => (prev ? { ...prev, phase: 'connecting' } : prev));
 
-          const pc = createPeerConnection(callId, current.peer.id);
+          const pc = createPeerConnection(callId, current.peer.id, current.callType, true);
+          scheduleRelayFallback(callId, current.peer.id, current.callType);
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
           ws.send(
@@ -497,6 +747,22 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           } else {
             pendingIceRef.current.push(cand);
           }
+        } else if (msg.type === 'relay:audio' && typeof msg.pcm === 'string') {
+          const current = callSessionRef.current;
+          if (current && current.callId === String(msg.callId)) {
+            if (!relayActiveRef.current) {
+              activateMediaRelay(current.callId, current.peer.id, current.callType);
+            }
+            relayRef.current?.playIncomingAudio(msg.pcm, Number(msg.sr) || 16000);
+          }
+        } else if (msg.type === 'relay:video' && typeof msg.jpg === 'string') {
+          const current = callSessionRef.current;
+          if (current && current.callId === String(msg.callId)) {
+            if (!relayActiveRef.current) {
+              activateMediaRelay(current.callId, current.peer.id, current.callType);
+            }
+            setRelayVideoFrame(msg.jpg);
+          }
         }
       };
 
@@ -524,7 +790,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       wsRef.current?.close();
       wsRef.current = null;
     };
-  }, [user, refreshAllData, cleanupCallMedia, createPeerConnection]);
+  }, [user, refreshAllData, cleanupCallMedia, createPeerConnection, activateMediaRelay, scheduleRelayFallback]);
 
   const startOutgoingCall = async (peer: PublicUser, callType: 'audio' | 'video') => {
     if (callSessionRef.current) return;
@@ -579,6 +845,8 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     const current = callSessionRef.current;
     if (!current) return;
     ringtone.stop();
+    stopNativeRinging();
+    setNativeCallAudioMode(true, speakerOnRef.current);
     const connectingSession: ActiveCallSession = { ...current, phase: 'connecting' };
     callSessionRef.current = connectingSession;
     setCallSession(connectingSession);
@@ -592,7 +860,8 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       return;
     }
 
-    const pc = createPeerConnection(current.callId, current.peer.id);
+    const pc = createPeerConnection(current.callId, current.peer.id, current.callType, false);
+    scheduleRelayFallback(current.callId, current.peer.id, current.callType);
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'call:accept', callId: current.callId }));
     }
@@ -678,6 +947,27 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       const sender = pcRef.current?.getSenders().find((s) => s.track?.kind === 'video');
       if (sender) {
         await sender.replaceTrack(newVideoTrack);
+      }
+      if (relayActiveRef.current && relayRef.current && callSessionRef.current) {
+        const cur = callSessionRef.current;
+        relayRef.current.updateVideoStream(
+          localStreamRef.current,
+          cur.callType === 'video',
+          dataSaverRef.current,
+          () => cameraOffRef.current,
+          (jpg) => {
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(
+                JSON.stringify({
+                  type: 'relay:video',
+                  callId: cur.callId,
+                  targetUserId: cur.peer.id,
+                  jpg,
+                })
+              );
+            }
+          }
+        );
       }
     } catch {
       // Device may only have one camera
@@ -907,6 +1197,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             }}
             onLoggedOut={() => {
               cleanupCallMedia();
+              clearNativeSessionAuth();
               setAuthToken(null);
               setUser(null);
               setFriends([]);
@@ -996,13 +1287,23 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         dataSaver={user.dataSaver}
         durationSec={callDurationSec}
         mediaError={mediaError}
+        relayVideoFrame={relayVideoFrame}
         onAccept={acceptIncomingCall}
         onReject={rejectIncomingCall}
         onEnd={endActiveCall}
         onToggleMute={toggleMute}
         onToggleCamera={toggleCamera}
         onFlipCamera={flipCamera}
-        onToggleSpeaker={() => setSpeakerOn((s) => !s)}
+        onToggleSpeaker={() => {
+          setSpeakerOn((prev) => {
+            const next = !prev;
+            setNativeSpeakerphone(next);
+            if (!hasNativeAndroidBridge()) {
+              relayRef.current?.setOutputGain(next ? 1 : 0);
+            }
+            return next;
+          });
+        }}
       />
     </div>
   );

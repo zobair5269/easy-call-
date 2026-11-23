@@ -313,6 +313,9 @@ export async function compileDirectAndroidApk(
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
@@ -330,19 +333,449 @@ export async function compileDirectAndroidApk(
             android:name="${sanitizeXmlText(cfg.applicationId)}.MainActivity"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
             android:exported="true"
-            android:launchMode="singleTask">
+            android:launchMode="singleTask"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name="${sanitizeXmlText(cfg.applicationId)}.EasyCallService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>
 `,
       'utf8'
     );
 
-    // 5. Write MainActivity.java serving bundled assets/www/ on https://easycall.app/
+    // 5. Write EasyCallService.java (background SSE listener + call/message notifications)
+    const servicePath = path.join(srcDir, 'EasyCallService.java');
+    fs.writeFileSync(
+      servicePath,
+      `package ${cfg.applicationId};
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.ServiceInfo;
+import android.media.AudioAttributes;
+import android.media.Ringtone;
+import android.media.RingtoneManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.IBinder;
+import android.os.PowerManager;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import org.json.JSONObject;
+
+public class EasyCallService extends Service {
+    public static final String PREFS_NAME = "easycall_prefs";
+    public static final String ACTION_START = "app.easycall.action.START";
+    public static final String ACTION_STOP_RING = "app.easycall.action.STOP_RING";
+    public static final String ACTION_DECLINE_CALL = "app.easycall.action.DECLINE_CALL";
+    public static final String EXTRA_CALL_ID = "call_id";
+
+    private static final String CHANNEL_BG = "easycall_bg_sync";
+    private static final String CHANNEL_MSG = "easycall_messages";
+    private static final String CHANNEL_CALL = "easycall_incoming_calls";
+    private static final int FG_NOTIF_ID = 101;
+    private static final int CALL_NOTIF_ID = 202;
+
+    public static volatile boolean isAppForeground = false;
+    private static volatile Ringtone activeRingtone = null;
+    private static volatile Vibrator activeVibrator = null;
+    private static volatile String activeRingingCallId = null;
+
+    private volatile boolean running = false;
+    private Thread workerThread = null;
+    private int msgNotifSeq = 300;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        ensureChannels();
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        ensureChannels();
+        startForegroundCompat();
+
+        String action = intent != null ? intent.getAction() : null;
+        if (ACTION_STOP_RING.equals(action)) {
+            stopRingingStatic(this);
+        } else if (ACTION_DECLINE_CALL.equals(action)) {
+            final String callId = intent.getStringExtra(EXTRA_CALL_ID);
+            stopRingingStatic(this);
+            if (callId != null && !callId.isEmpty()) {
+                declineCallAsync(callId);
+            }
+        }
+
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        String token = prefs.getString("authToken", "");
+        if (token == null || token.trim().isEmpty()) {
+            running = false;
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
+        if (!running || workerThread == null || !workerThread.isAlive()) {
+            running = true;
+            workerThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    runSseLoop();
+                }
+            }, "EasyCallBgStream");
+            workerThread.start();
+        }
+
+        return START_STICKY;
+    }
+
+    @Override
+    public void onDestroy() {
+        running = false;
+        stopRingingStatic(this);
+        if (workerThread != null) {
+            workerThread.interrupt();
+            workerThread = null;
+        }
+        super.onDestroy();
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+
+    private void startForegroundCompat() {
+        Notification.Builder nb = Build.VERSION.SDK_INT >= 26
+            ? new Notification.Builder(this, CHANNEL_BG)
+            : new Notification.Builder(this);
+
+        Intent openIntent = new Intent(this, MainActivity.class);
+        openIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        int piFlags = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
+        PendingIntent pi = PendingIntent.getActivity(this, 10, openIntent, piFlags);
+
+        nb.setSmallIcon(R.mipmap.ic_launcher)
+          .setContentTitle("EASY CALL")
+          .setContentText("Ready for incoming calls & messages")
+          .setOngoing(true)
+          .setContentIntent(pi);
+
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(FG_NOTIF_ID, nb.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+        } else {
+            startForeground(FG_NOTIF_ID, nb.build());
+        }
+    }
+
+    private void ensureChannels() {
+        if (Build.VERSION.SDK_INT < 26) return;
+        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null) return;
+
+        NotificationChannel bg = new NotificationChannel(CHANNEL_BG, "Background Connection", NotificationManager.IMPORTANCE_LOW);
+        bg.setSound(null, null);
+        bg.enableVibration(false);
+        nm.createNotificationChannel(bg);
+
+        NotificationChannel msg = new NotificationChannel(CHANNEL_MSG, "Messages & Friend Requests", NotificationManager.IMPORTANCE_HIGH);
+        msg.enableVibration(true);
+        nm.createNotificationChannel(msg);
+
+        NotificationChannel call = new NotificationChannel(CHANNEL_CALL, "Incoming Calls", NotificationManager.IMPORTANCE_HIGH);
+        call.setSound(null, null);
+        call.enableVibration(false);
+        nm.createNotificationChannel(call);
+    }
+
+    private void runSseLoop() {
+        int backoffMs = 2000;
+        while (running) {
+            HttpURLConnection conn = null;
+            try {
+                SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                String serverUrl = prefs.getString("serverUrl", "").replaceAll("/+$", "");
+                String token = prefs.getString("authToken", "");
+                if (serverUrl.isEmpty() || token.isEmpty()) {
+                    running = false;
+                    stopSelf();
+                    return;
+                }
+
+                URL url = new URL(serverUrl + "/api/events/stream");
+                conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("GET");
+                conn.setRequestProperty("Authorization", "Bearer " + token);
+                conn.setRequestProperty("Accept", "text/event-stream");
+                conn.setRequestProperty("X-Requested-With", "EasyCallClient");
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(45000);
+
+                int code = conn.getResponseCode();
+                if (code == 401) {
+                    prefs.edit().remove("authToken").apply();
+                    running = false;
+                    stopSelf();
+                    return;
+                }
+                if (code != 200) {
+                    throw new RuntimeException("HTTP " + code);
+                }
+
+                backoffMs = 2000;
+                BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"));
+                String line;
+                while (running && (line = reader.readLine()) != null) {
+                    if (line.startsWith("data:")) {
+                        String json = line.substring(5).trim();
+                        if (!json.isEmpty()) {
+                            handleSseEvent(json);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (conn != null) {
+                    try {
+                        conn.disconnect();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+
+            if (!running) break;
+            try {
+                Thread.sleep(backoffMs);
+            } catch (InterruptedException e) {
+                break;
+            }
+            backoffMs = Math.min(12000, backoffMs * 2);
+        }
+    }
+
+    private void handleSseEvent(String json) {
+        try {
+            JSONObject obj = new JSONObject(json);
+            String type = obj.optString("type", "");
+            if ("call:incoming".equals(type)) {
+                String callId = obj.optString("callId", "");
+                String callType = obj.optString("callType", "audio");
+                JSONObject caller = obj.optJSONObject("caller");
+                String callerName = caller != null ? caller.optString("displayName", "Incoming Call") : "Incoming Call";
+                if (callerName.isEmpty() && caller != null) {
+                    callerName = caller.optString("phoneE164", "Incoming Call");
+                }
+                if (!isAppForeground && !callId.equals(activeRingingCallId)) {
+                    showIncomingCallAlert(callId, callerName, "video".equals(callType));
+                }
+            } else if ("call:ended".equals(type) || "call:rejected".equals(type)) {
+                stopRingingStatic(this);
+            } else if ("chat:message".equals(type)) {
+                if (!isAppForeground) {
+                    String senderName = obj.optString("senderName", "EASY CALL");
+                    JSONObject msg = obj.optJSONObject("message");
+                    String body = msg != null ? msg.optString("body", "") : "";
+                    if (body.isEmpty()) {
+                        body = "Sent a photo";
+                    }
+                    showMessageNotification(senderName, body);
+                }
+            } else if ("friend_request:new".equals(type)) {
+                if (!isAppForeground) {
+                    JSONObject fromUser = obj.optJSONObject("fromUser");
+                    String name = fromUser != null ? fromUser.optString("displayName", "Someone") : "Someone";
+                    showMessageNotification("New Friend Request", name + " wants to connect on EASY CALL");
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void showIncomingCallAlert(String callId, String callerName, boolean isVideo) {
+        activeRingingCallId = callId;
+        startRinging();
+
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                PowerManager.WakeLock wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "easycall:incoming");
+                wl.acquire(15000);
+            }
+        } catch (Throwable ignored) {
+        }
+
+        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null) return;
+
+        int piFlags = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
+
+        Intent fullIntent = new Intent(this, MainActivity.class);
+        fullIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        fullIntent.putExtra("incomingCallId", callId);
+        PendingIntent fullPi = PendingIntent.getActivity(this, 21, fullIntent, piFlags);
+
+        Intent declineIntent = new Intent(this, EasyCallService.class);
+        declineIntent.setAction(ACTION_DECLINE_CALL);
+        declineIntent.putExtra(EXTRA_CALL_ID, callId);
+        PendingIntent declinePi = PendingIntent.getService(this, 22, declineIntent, piFlags);
+
+        Notification.Builder nb = Build.VERSION.SDK_INT >= 26
+            ? new Notification.Builder(this, CHANNEL_CALL)
+            : new Notification.Builder(this);
+
+        nb.setSmallIcon(R.mipmap.ic_launcher)
+          .setContentTitle(isVideo ? "Incoming Video Call" : "Incoming Audio Call")
+          .setContentText(callerName + " is calling...")
+          .setPriority(Notification.PRIORITY_MAX)
+          .setCategory(Notification.CATEGORY_CALL)
+          .setOngoing(true)
+          .setAutoCancel(true)
+          .setContentIntent(fullPi)
+          .setFullScreenIntent(fullPi, true)
+          .addAction(0, "Answer", fullPi)
+          .addAction(0, "Decline", declinePi);
+
+        nm.notify(CALL_NOTIF_ID, nb.build());
+
+        try {
+            startActivity(fullIntent);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void showMessageNotification(String title, String text) {
+        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null) return;
+
+        int piFlags = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
+        Intent openIntent = new Intent(this, MainActivity.class);
+        openIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent openPi = PendingIntent.getActivity(this, 31, openIntent, piFlags);
+
+        Notification.Builder nb = Build.VERSION.SDK_INT >= 26
+            ? new Notification.Builder(this, CHANNEL_MSG)
+            : new Notification.Builder(this);
+
+        nb.setSmallIcon(R.mipmap.ic_launcher)
+          .setContentTitle(title)
+          .setContentText(text)
+          .setPriority(Notification.PRIORITY_HIGH)
+          .setDefaults(Notification.DEFAULT_ALL)
+          .setAutoCancel(true)
+          .setContentIntent(openPi);
+
+        msgNotifSeq = msgNotifSeq >= 399 ? 300 : msgNotifSeq + 1;
+        nm.notify(msgNotifSeq, nb.build());
+    }
+
+    private void startRinging() {
+        try {
+            stopRingingStatic(this);
+            Uri ringUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE);
+            if (ringUri != null) {
+                Ringtone rt = RingtoneManager.getRingtone(this, ringUri);
+                if (rt != null) {
+                    if (Build.VERSION.SDK_INT >= 28) {
+                        rt.setLooping(true);
+                    }
+                    if (Build.VERSION.SDK_INT >= 21) {
+                        rt.setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build());
+                    }
+                    rt.play();
+                    activeRingtone = rt;
+                }
+            }
+            Vibrator vib = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+            if (vib != null && vib.hasVibrator()) {
+                long[] pattern = new long[]{0, 600, 800};
+                if (Build.VERSION.SDK_INT >= 26) {
+                    vib.vibrate(VibrationEffect.createWaveform(pattern, 0));
+                } else {
+                    vib.vibrate(pattern, 0);
+                }
+                activeVibrator = vib;
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static void stopRingingStatic(Context ctx) {
+        activeRingingCallId = null;
+        try {
+            if (activeRingtone != null) {
+                activeRingtone.stop();
+                activeRingtone = null;
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (activeVibrator != null) {
+                activeVibrator.cancel();
+                activeVibrator = null;
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) {
+                nm.cancel(CALL_NOTIF_ID);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void declineCallAsync(final String callId) {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                    String serverUrl = prefs.getString("serverUrl", "").replaceAll("/+$", "");
+                    String token = prefs.getString("authToken", "");
+                    if (serverUrl.isEmpty() || token.isEmpty()) return;
+                    URL url = new URL(serverUrl + "/api/calls/" + callId + "/decline");
+                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                    conn.setRequestMethod("POST");
+                    conn.setRequestProperty("Authorization", "Bearer " + token);
+                    conn.setRequestProperty("X-Requested-With", "EasyCallClient");
+                    conn.setDoOutput(true);
+                    conn.getOutputStream().write(new byte[0]);
+                    conn.getResponseCode();
+                    conn.disconnect();
+                } catch (Throwable ignored) {
+                }
+            }
+        }).start();
+    }
+}
+`,
+      'utf8'
+    );
+
+    // 6. Write MainActivity.java serving bundled assets/www/ on https://easycall.app/
     const mainActivityPath = path.join(srcDir, 'MainActivity.java');
     fs.writeFileSync(
       mainActivityPath,
@@ -353,6 +786,7 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.AssetManager;
 import android.graphics.Color;
@@ -363,7 +797,9 @@ import android.os.Bundle;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
@@ -396,6 +832,11 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        if (Build.VERSION.SDK_INT >= 27) {
+            setShowWhenLocked(true);
+            setTurnScreenOn(true);
+        }
+
         try {
             final FrameLayout root = new FrameLayout(this);
             root.setBackgroundColor(Color.parseColor("#f8fafc"));
@@ -418,6 +859,8 @@ public class MainActivity extends Activity {
                 cookieManager.setAcceptThirdPartyCookies(webView, true);
             } catch (Throwable ignored) {
             }
+
+            webView.addJavascriptInterface(new EasyCallBridge(), "EasyCallNative");
 
             webView.setWebViewClient(new WebViewClient() {
                 @Override
@@ -475,11 +918,6 @@ public class MainActivity extends Activity {
                         public void run() {
                             try {
                                 if (allowed) {
-                                    AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-                                    if (am != null) {
-                                        am.setMode(AudioManager.MODE_IN_COMMUNICATION);
-                                        am.setSpeakerphoneOn(true);
-                                    }
                                     request.grant(request.getResources());
                                 } else {
                                     request.deny();
@@ -578,6 +1016,114 @@ public class MainActivity extends Activity {
         }
     }
 
+    @Override
+    protected void onResume() {
+        super.onResume();
+        EasyCallService.isAppForeground = true;
+        if (webView != null) {
+            webView.onResume();
+            webView.evaluateJavascript("window.dispatchEvent(new Event('easycall:resume'))", null);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        EasyCallService.isAppForeground = false;
+        super.onPause();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (webView != null) {
+            webView.evaluateJavascript("window.dispatchEvent(new Event('easycall:resume'))", null);
+        }
+    }
+
+    private class EasyCallBridge {
+        @JavascriptInterface
+        public void setSessionAuth(final String serverUrl, final String token, final String userId) {
+            try {
+                SharedPreferences prefs = getSharedPreferences(EasyCallService.PREFS_NAME, MODE_PRIVATE);
+                prefs.edit()
+                    .putString("serverUrl", serverUrl != null ? serverUrl.trim() : "")
+                    .putString("authToken", token != null ? token.trim() : "")
+                    .putString("userId", userId != null ? userId.trim() : "")
+                    .apply();
+
+                if (token != null && !token.trim().isEmpty()) {
+                    Intent svc = new Intent(MainActivity.this, EasyCallService.class);
+                    svc.setAction(EasyCallService.ACTION_START);
+                    if (Build.VERSION.SDK_INT >= 26) {
+                        startForegroundService(svc);
+                    } else {
+                        startService(svc);
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        @JavascriptInterface
+        public void clearSessionAuth() {
+            try {
+                SharedPreferences prefs = getSharedPreferences(EasyCallService.PREFS_NAME, MODE_PRIVATE);
+                prefs.edit().remove("authToken").remove("userId").apply();
+                stopService(new Intent(MainActivity.this, EasyCallService.class));
+            } catch (Throwable ignored) {
+            }
+        }
+
+        @JavascriptInterface
+        public void stopRinging() {
+            EasyCallService.stopRingingStatic(MainActivity.this);
+        }
+
+        @JavascriptInterface
+        public void setCallAudioMode(final boolean inCall, final boolean speakerOn) {
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                        if (am != null) {
+                            if (inCall) {
+                                am.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                                am.setSpeakerphoneOn(speakerOn);
+                            } else {
+                                am.setSpeakerphoneOn(false);
+                                am.setMode(AudioManager.MODE_NORMAL);
+                            }
+                        }
+                        if (inCall) {
+                            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        } else {
+                            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void setSpeakerphone(final boolean speakerOn) {
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                        if (am != null) {
+                            am.setSpeakerphoneOn(speakerOn);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+        }
+    }
+
     private WebResourceResponse serveLocalAsset(String rawPath) {
         String rel = (rawPath == null || rawPath.isEmpty() || "/".equals(rawPath))
             ? "index.html"
@@ -642,6 +1188,11 @@ public class MainActivity extends Activity {
                     needed.add(p);
                 }
             }
+            if (Build.VERSION.SDK_INT >= 31) {
+                if (checkSelfPermission("android.permission.BLUETOOTH_CONNECT") != PackageManager.PERMISSION_GRANTED) {
+                    needed.add("android.permission.BLUETOOTH_CONNECT");
+                }
+            }
             if (Build.VERSION.SDK_INT >= 33) {
                 if (checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
                     needed.add("android.permission.POST_NOTIFICATIONS");
@@ -680,11 +1231,11 @@ public class MainActivity extends Activity {
       'utf8'
     );
 
-    // 6. Compile resources with aapt2
+    // 7. Compile resources with aapt2
     const resZip = path.join(workDir, 'res.zip');
     await execFileAsync(tc.aapt2Path, ['compile', '--dir', resDir, '-o', resZip]);
 
-    // 7. Link resources + AndroidManifest + bundled assets/www into unsigned.apk
+    // 8. Link resources + AndroidManifest + bundled assets/www into unsigned.apk
     const unsignedApk = path.join(workDir, 'unsigned.apk');
     await execFileAsync(tc.aapt2Path, [
       'link',
@@ -707,9 +1258,9 @@ public class MainActivity extends Activity {
       '--auto-add-overlay',
     ]);
 
-    // 8. Compile Java sources (R.java + MainActivity.java)
+    // 9. Compile Java sources (R.java + EasyCallService.java + MainActivity.java)
     const rJavaPath = path.join(genDir, pkgRelPath, 'R.java');
-    const javaSources = [mainActivityPath];
+    const javaSources = [servicePath, mainActivityPath];
     if (fs.existsSync(rJavaPath)) {
       javaSources.unshift(rJavaPath);
     }

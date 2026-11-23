@@ -28,7 +28,13 @@ import {
   verifyPin,
   verifySameOriginIfCookie,
 } from './security.ts';
-import { isUserOnline, sendToUser } from './ws.ts';
+import {
+  isUserOnline,
+  registerBackgroundStream,
+  rejectIncomingCallById,
+  sendToUser,
+  unregisterBackgroundStream,
+} from './ws.ts';
 
 interface AuthedRequest extends Request {
   user?: UserRow;
@@ -1322,6 +1328,96 @@ export function createApiRouter(): Router {
     ).run(crypto.randomUUID(), user.id, platform, token, Date.now());
 
     res.json({ ok: true });
+  });
+
+  router.get('/events/stream', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    registerBackgroundStream(user.id, res);
+    res.write(`data: ${JSON.stringify({ type: 'sse:ready', userId: user.id })}\n\n`);
+
+    const cutoff = Date.now() - 48_000;
+    const ringing = db
+      .prepare(
+        `SELECT id, caller_id, call_type FROM call_records
+         WHERE callee_id = ? AND status = 'ringing' AND started_at > ?
+         ORDER BY started_at DESC LIMIT 1`
+      )
+      .get(user.id, cutoff) as { id: string; caller_id: string; call_type: 'audio' | 'video' } | undefined;
+
+    if (ringing) {
+      const caller = db.prepare('SELECT * FROM users WHERE id = ?').get(ringing.caller_id) as
+        | UserRow
+        | undefined;
+      if (caller && !isBlockedBetween(user.id, caller.id)) {
+        res.write(
+          `data: ${JSON.stringify({
+            type: 'call:incoming',
+            callId: ringing.id,
+            callType: ringing.call_type,
+            caller: getPublicUserView(caller, true),
+          })}\n\n`
+        );
+      }
+    }
+
+    const heartbeat = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(': ping\n\n');
+      }
+    }, 20_000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      unregisterBackgroundStream(user.id, res);
+    });
+  });
+
+  router.get('/calls/active-incoming', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    const cutoff = Date.now() - 48_000;
+    const ringing = db
+      .prepare(
+        `SELECT id, caller_id, call_type, started_at FROM call_records
+         WHERE callee_id = ? AND status = 'ringing' AND started_at > ?
+         ORDER BY started_at DESC LIMIT 1`
+      )
+      .get(user.id, cutoff) as
+      | { id: string; caller_id: string; call_type: 'audio' | 'video'; started_at: number }
+      | undefined;
+
+    if (!ringing) {
+      res.json({ incoming: null });
+      return;
+    }
+
+    const caller = db.prepare('SELECT * FROM users WHERE id = ?').get(ringing.caller_id) as
+      | UserRow
+      | undefined;
+    if (!caller || isBlockedBetween(user.id, caller.id)) {
+      res.json({ incoming: null });
+      return;
+    }
+
+    res.json({
+      incoming: {
+        callId: ringing.id,
+        callType: ringing.call_type,
+        startedAt: ringing.started_at,
+        caller: getPublicUserView(caller, true),
+      },
+    });
+  });
+
+  router.post('/calls/:id/decline', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    const declined = rejectIncomingCallById(req.params.id, user.id);
+    res.json({ ok: true, declined });
   });
 
   return router;
