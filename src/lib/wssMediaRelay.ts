@@ -17,23 +17,35 @@ function base64ToInt16(b64: string): Int16Array {
   return new Int16Array(bytes.buffer, 0, Math.floor(bytes.byteLength / 2));
 }
 
-function downsampleTo16k(input: Float32Array, inputRate: number): Int16Array {
-  const targetRate = 16000;
+function downsampleWithAntiAlias(
+  input: Float32Array,
+  inputRate: number,
+  targetRate: number
+): Int16Array {
   if (inputRate <= targetRate) {
     const out = new Int16Array(input.length);
     for (let i = 0; i < input.length; i++) {
-      const s = Math.max(-1, Math.min(1, input[i]));
-      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      const s = Math.max(-0.98, Math.min(0.98, input[i]));
+      out[i] = s < 0 ? Math.round(s * 0x7fff) : Math.round(s * 0x7fff);
     }
     return out;
   }
+
   const ratio = inputRate / targetRate;
   const outLength = Math.max(1, Math.floor(input.length / ratio));
   const out = new Int16Array(outLength);
+
+  // Boxcar low-pass averaging across each decimation window prevents Nyquist aliasing noise
   for (let i = 0; i < outLength; i++) {
-    const srcIdx = Math.min(input.length - 1, Math.floor(i * ratio));
-    const s = Math.max(-1, Math.min(1, input[srcIdx]));
-    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    const start = Math.floor(i * ratio);
+    const end = Math.min(input.length, Math.max(start + 1, Math.floor((i + 1) * ratio)));
+    let sum = 0;
+    for (let j = start; j < end; j++) {
+      sum += input[j];
+    }
+    const avg = sum / (end - start);
+    const clipped = Math.max(-0.98, Math.min(0.98, avg));
+    out[i] = Math.round(clipped * 0x7fff);
   }
   return out;
 }
@@ -70,8 +82,11 @@ export class WssMediaRelay {
       window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
 
+    const targetSampleRate = opts.dataSaver ? 16000 : 24000;
+    const chunkSizeSamples = Math.round(targetSampleRate * 0.04); // 40ms packets
+
     try {
-      this.playbackCtx = new AudioCtx();
+      this.playbackCtx = new AudioCtx({ latencyHint: 'interactive' });
       this.playbackCtx.resume().catch(() => {});
       this.playbackGain = this.playbackCtx.createGain();
       this.playbackGain.gain.value = 1;
@@ -82,7 +97,7 @@ export class WssMediaRelay {
 
     if (opts.localStream && opts.localStream.getAudioTracks().length > 0) {
       try {
-        this.captureCtx = new AudioCtx();
+        this.captureCtx = new AudioCtx({ latencyHint: 'interactive' });
         this.captureCtx.resume().catch(() => {});
         const audioOnlyStream = new MediaStream(opts.localStream.getAudioTracks());
         this.sourceNode = this.captureCtx.createMediaStreamSource(audioOnlyStream);
@@ -93,13 +108,17 @@ export class WssMediaRelay {
         this.processor.onaudioprocess = (ev) => {
           if (this.stopped || opts.isMuted()) return;
           const input = ev.inputBuffer.getChannelData(0);
-          const down = downsampleTo16k(input, this.captureCtx?.sampleRate || 48000);
+          const down = downsampleWithAntiAlias(
+            input,
+            this.captureCtx?.sampleRate || 48000,
+            targetSampleRate
+          );
           for (let i = 0; i < down.length; i++) {
             this.sampleBuffer.push(down[i]);
           }
-          while (this.sampleBuffer.length >= 1600) {
-            const batch = new Int16Array(this.sampleBuffer.splice(0, 1600));
-            opts.onSendAudio(int16ToBase64(batch), 16000);
+          while (this.sampleBuffer.length >= chunkSizeSamples) {
+            const batch = new Int16Array(this.sampleBuffer.splice(0, chunkSizeSamples));
+            opts.onSendAudio(int16ToBase64(batch), targetSampleRate);
           }
         };
 
@@ -167,7 +186,7 @@ export class WssMediaRelay {
     }, dataSaver ? 220 : 150);
   }
 
-  playIncomingAudio(pcmBase64: string, sampleRate = 16000) {
+  playIncomingAudio(pcmBase64: string, sampleRate = 24000) {
     if (this.stopped || !this.playbackCtx || !this.playbackGain) return;
     if (this.playbackCtx.state === 'suspended') {
       this.playbackCtx.resume().catch(() => {});
@@ -175,15 +194,27 @@ export class WssMediaRelay {
     try {
       const pcm = base64ToInt16(pcmBase64);
       if (pcm.length === 0) return;
-      const buf = this.playbackCtx.createBuffer(1, pcm.length, sampleRate);
+      const safeRate = sampleRate >= 8000 && sampleRate <= 48000 ? sampleRate : 24000;
+      const buf = this.playbackCtx.createBuffer(1, pcm.length, safeRate);
       const ch = buf.getChannelData(0);
+      const fadeSamples = Math.min(24, Math.floor(pcm.length / 8));
       for (let i = 0; i < pcm.length; i++) {
-        ch[i] = pcm[i] / 0x8000;
+        let s = pcm[i] / 0x8000;
+        if (i < fadeSamples) {
+          s *= i / fadeSamples;
+        } else if (i >= pcm.length - fadeSamples) {
+          s *= (pcm.length - 1 - i) / fadeSamples;
+        }
+        ch[i] = s;
       }
 
       const now = this.playbackCtx.currentTime;
-      if (this.nextPlayTime < now || this.nextPlayTime > now + 0.45) {
-        this.nextPlayTime = now + 0.04;
+      if (this.nextPlayTime === 0) {
+        this.nextPlayTime = now + 0.06;
+      } else if (this.nextPlayTime < now - 0.01) {
+        this.nextPlayTime = now + 0.025;
+      } else if (this.nextPlayTime > now + 0.3) {
+        this.nextPlayTime = now + 0.06;
       }
       const src = this.playbackCtx.createBufferSource();
       src.buffer = buf;

@@ -12,10 +12,24 @@ const userSockets = new Map<string, Set<WebSocket>>();
 const backgroundStreams = new Map<string, Set<ServerResponse>>();
 const ringTimeouts = new Map<string, NodeJS.Timeout>();
 
+interface CallSignalCache {
+  callerId: string;
+  calleeId: string;
+  offer?: unknown;
+  answer?: unknown;
+  callerIce: unknown[];
+  calleeIce: unknown[];
+  relayActivated: boolean;
+  updatedAt: number;
+}
+
+const activeCallSignals = new Map<string, CallSignalCache>();
+
 const BG_EVENT_TYPES = new Set([
   'call:incoming',
   'call:ended',
   'call:rejected',
+  'call:accepted',
   'chat:message',
   'friend_request:new',
   'friend_request:accepted',
@@ -163,6 +177,142 @@ function clearRingTimeout(callId: string) {
   }
 }
 
+function replayCachedSignalsForUser(ws: WebSocket, userId: string, onlyCallId?: string) {
+  const now = Date.now();
+  const activeCalls = db
+    .prepare(
+      `SELECT id, caller_id, callee_id, status, started_at
+       FROM call_records
+       WHERE (caller_id = ? OR callee_id = ?)
+         AND status = 'active'
+         AND started_at > ?`
+    )
+    .all(userId, userId, now - 10 * 60_000) as Array<{
+    id: string;
+    caller_id: string;
+    callee_id: string;
+    status: string;
+    started_at: number;
+  }>;
+
+  for (const call of activeCalls) {
+    if (onlyCallId && call.id !== onlyCallId) continue;
+    const cache = activeCallSignals.get(call.id);
+    if (!cache) continue;
+    const isCaller = call.caller_id === userId;
+    const peerId = isCaller ? call.callee_id : call.caller_id;
+
+    if (isCaller) {
+      if (cache.answer) {
+        ws.send(
+          JSON.stringify({
+            type: 'webrtc:answer',
+            callId: call.id,
+            targetUserId: userId,
+            fromUserId: peerId,
+            sdp: cache.answer,
+          })
+        );
+      }
+      for (const cand of cache.calleeIce) {
+        ws.send(
+          JSON.stringify({
+            type: 'webrtc:ice-candidate',
+            callId: call.id,
+            targetUserId: userId,
+            fromUserId: peerId,
+            candidate: cand,
+          })
+        );
+      }
+    } else {
+      if (cache.offer) {
+        ws.send(
+          JSON.stringify({
+            type: 'webrtc:offer',
+            callId: call.id,
+            targetUserId: userId,
+            fromUserId: peerId,
+            sdp: cache.offer,
+          })
+        );
+      }
+      for (const cand of cache.callerIce) {
+        ws.send(
+          JSON.stringify({
+            type: 'webrtc:ice-candidate',
+            callId: call.id,
+            targetUserId: userId,
+            fromUserId: peerId,
+            candidate: cand,
+          })
+        );
+      }
+    }
+
+    if (cache.relayActivated) {
+      ws.send(
+        JSON.stringify({
+          type: 'relay:activate',
+          callId: call.id,
+          targetUserId: userId,
+          fromUserId: peerId,
+        })
+      );
+    }
+  }
+}
+
+export function acceptIncomingCallById(callId: string, userId: string): {
+  ok: boolean;
+  alreadyActive?: boolean;
+} {
+  const call = db
+    .prepare('SELECT * FROM call_records WHERE id = ? AND callee_id = ?')
+    .get(callId, userId) as
+    | { id: string; caller_id: string; callee_id: string; status: string }
+    | undefined;
+  if (!call) return { ok: false };
+  if (call.status === 'active') {
+    return { ok: true, alreadyActive: true };
+  }
+  if (call.status !== 'ringing') {
+    return { ok: false };
+  }
+
+  clearRingTimeout(callId);
+  const now = Date.now();
+  db.prepare(`UPDATE call_records SET status = 'active', answered_at = ? WHERE id = ?`).run(
+    now,
+    callId
+  );
+
+  if (!activeCallSignals.has(callId)) {
+    activeCallSignals.set(callId, {
+      callerId: call.caller_id,
+      calleeId: call.callee_id,
+      callerIce: [],
+      calleeIce: [],
+      relayActivated: false,
+      updatedAt: now,
+    });
+  }
+
+  sendToUser(call.caller_id, {
+    type: 'call:accepted',
+    callId,
+    byUserId: userId,
+  });
+  // Notify callee's background service / other windows to stop ringing immediately
+  sendToUser(call.callee_id, {
+    type: 'call:accepted',
+    callId,
+    byUserId: userId,
+  });
+
+  return { ok: true };
+}
+
 export function rejectIncomingCallById(callId: string, userId: string): boolean {
   const call = db
     .prepare('SELECT * FROM call_records WHERE id = ? AND callee_id = ?')
@@ -172,6 +322,7 @@ export function rejectIncomingCallById(callId: string, userId: string): boolean 
   if (!call || call.status !== 'ringing') return false;
 
   clearRingTimeout(callId);
+  activeCallSignals.delete(callId);
   db.prepare(
     `UPDATE call_records SET status = 'rejected', ended_at = ? WHERE id = ?`
   ).run(Date.now(), callId);
@@ -221,6 +372,7 @@ export function initWebSocketServer(httpServer: HttpServer) {
         broadcastPresenceToFriends(userId, true);
       }
       ws.send(JSON.stringify({ type: 'ws:ready', userId }));
+      replayCachedSignalsForUser(ws, userId);
     };
 
     if (authedUserId) {
@@ -294,10 +446,25 @@ export function initWebSocketServer(httpServer: HttpServer) {
 
         const callId = crypto.randomUUID();
         const now = Date.now();
+        // Expire any stale ringing calls for this caller/callee pair so old calls never block new ones
+        db.prepare(
+          `UPDATE call_records
+           SET status = 'missed', ended_at = ?
+           WHERE status = 'ringing' AND (caller_id = ? OR (callee_id = ? AND started_at < ?))`
+        ).run(now, userId, targetUserId, now - 45_000);
+
         db.prepare(
           `INSERT INTO call_records (id, caller_id, callee_id, call_type, status, started_at)
            VALUES (?, ?, ?, ?, 'ringing', ?)`
         ).run(callId, userId, targetUserId, callType, now);
+        activeCallSignals.set(callId, {
+          callerId: userId,
+          calleeId: targetUserId,
+          callerIce: [],
+          calleeIce: [],
+          relayActivated: false,
+          updatedAt: now,
+        });
 
         const targetOnline = isUserOnline(targetUserId);
         ws.send(
@@ -383,24 +550,15 @@ export function initWebSocketServer(httpServer: HttpServer) {
 
       if (msg.type === 'call:accept') {
         const callId = typeof msg.callId === 'string' ? msg.callId : '';
-        const call = db
-          .prepare('SELECT * FROM call_records WHERE id = ? AND callee_id = ?')
-          .get(callId, userId) as
-          | { id: string; caller_id: string; callee_id: string; status: string }
-          | undefined;
-        if (!call || call.status !== 'ringing') return;
+        if (callId) {
+          acceptIncomingCallById(callId, userId);
+        }
+        return;
+      }
 
-        clearRingTimeout(callId);
-        const now = Date.now();
-        db.prepare(
-          `UPDATE call_records SET status = 'active', answered_at = ? WHERE id = ?`
-        ).run(now, callId);
-
-        sendToUser(call.caller_id, {
-          type: 'call:accepted',
-          callId,
-          byUserId: userId,
-        });
+      if (msg.type === 'call:sync') {
+        const callId = typeof msg.callId === 'string' ? msg.callId : undefined;
+        replayCachedSignalsForUser(ws, userId, callId);
         return;
       }
 
@@ -427,6 +585,7 @@ export function initWebSocketServer(httpServer: HttpServer) {
         if (!call || ['completed', 'missed', 'rejected', 'cancelled'].includes(call.status)) return;
 
         clearRingTimeout(callId);
+        activeCallSignals.delete(callId);
         const endedAt = Date.now();
         let nextStatus = 'completed';
         let durationSec = 0;
@@ -484,13 +643,49 @@ export function initWebSocketServer(httpServer: HttpServer) {
 
         const call = db
           .prepare(
-            `SELECT 1 FROM call_records
+            `SELECT caller_id, callee_id FROM call_records
              WHERE id = ? AND ((caller_id = ? AND callee_id = ?) OR (caller_id = ? AND callee_id = ?))`
           )
-          .get(callId, userId, targetUserId, targetUserId, userId);
+          .get(callId, userId, targetUserId, targetUserId, userId) as
+          | { caller_id: string; callee_id: string }
+          | undefined;
 
         if (!call || isBlockedBetween(userId, targetUserId)) {
           return;
+        }
+
+        if (
+          msg.type === 'webrtc:offer' ||
+          msg.type === 'webrtc:answer' ||
+          msg.type === 'webrtc:ice-candidate' ||
+          msg.type === 'relay:activate'
+        ) {
+          let cache = activeCallSignals.get(callId);
+          if (!cache) {
+            cache = {
+              callerId: call.caller_id,
+              calleeId: call.callee_id,
+              callerIce: [],
+              calleeIce: [],
+              relayActivated: false,
+              updatedAt: Date.now(),
+            };
+            activeCallSignals.set(callId, cache);
+          }
+          cache.updatedAt = Date.now();
+          if (msg.type === 'webrtc:offer' && msg.sdp) {
+            cache.offer = msg.sdp;
+          } else if (msg.type === 'webrtc:answer' && msg.sdp) {
+            cache.answer = msg.sdp;
+          } else if (msg.type === 'webrtc:ice-candidate' && msg.candidate) {
+            if (userId === call.caller_id && cache.callerIce.length < 30) {
+              cache.callerIce.push(msg.candidate);
+            } else if (userId === call.callee_id && cache.calleeIce.length < 30) {
+              cache.calleeIce.push(msg.candidate);
+            }
+          } else if (msg.type === 'relay:activate') {
+            cache.relayActivated = true;
+          }
         }
 
         sendToUser(targetUserId, {

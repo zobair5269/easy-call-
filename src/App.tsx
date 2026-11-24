@@ -14,6 +14,7 @@ import { detectDeviceLanguage, getLanguageMeta, translate, type TranslationKeys 
 import { apiFetch, buildWsUrl, getAuthToken, initApiConfig, resolveApiUrl, setAuthToken } from './lib/api';
 import {
   clearNativeSessionAuth,
+  consumeNativePendingAcceptCallId,
   hasNativeAndroidBridge,
   setNativeCallAudioMode,
   setNativeRingtone,
@@ -103,6 +104,11 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const relayRef = useRef<WssMediaRelay | null>(null);
   const relayFallbackTimerRef = useRef<number | null>(null);
   const relayActiveRef = useRef(false);
+  const pendingAcceptCallIdRef = useRef<string | null>(null);
+  const reconnectWsRef = useRef<(() => void) | null>(null);
+  const lastPongAtRef = useRef<number>(Date.now());
+  const pongCheckTimerRef = useRef<number | null>(null);
+  const acceptIncomingCallRef = useRef<(explicitSession?: ActiveCallSession) => Promise<void>>(async () => {});
   const pendingOutIceRef = useRef<
     Array<{ callId: string; targetUserId: string; candidate: RTCIceCandidateInit }>
   >([]);
@@ -115,6 +121,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [relayVideoFrame, setRelayVideoFrame] = useState<string | null>(null);
+  const [relayActive, setRelayActive] = useState(false);
   const [muted, setMuted] = useState(false);
   const [cameraOff, setCameraOff] = useState(false);
   const [speakerOn, setSpeakerOn] = useState(true);
@@ -276,7 +283,25 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   }, [user, refreshAllData]);
 
   const checkPendingIncomingCall = useCallback(async () => {
-    if (!user || callSessionRef.current) return;
+    if (!user) return;
+    const nativeAcceptId = consumeNativePendingAcceptCallId();
+    if (nativeAcceptId) {
+      pendingAcceptCallIdRef.current = nativeAcceptId;
+    }
+
+    if (callSessionRef.current) {
+      if (
+        pendingAcceptCallIdRef.current &&
+        callSessionRef.current.callId === pendingAcceptCallIdRef.current &&
+        callSessionRef.current.direction === 'incoming' &&
+        callSessionRef.current.phase === 'ringing'
+      ) {
+        pendingAcceptCallIdRef.current = null;
+        void acceptIncomingCallRef.current(callSessionRef.current);
+      }
+      return;
+    }
+
     try {
       const res = await apiFetch<{
         incoming: {
@@ -288,7 +313,11 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       }>('/api/calls/active-incoming');
       if (res.incoming && !callSessionRef.current) {
         const inc = res.incoming;
-        if (!hasNativeAndroidBridge()) {
+        const shouldAutoAccept = pendingAcceptCallIdRef.current === inc.callId;
+        if (shouldAutoAccept) {
+          pendingAcceptCallIdRef.current = null;
+        }
+        if (!hasNativeAndroidBridge() && !shouldAutoAccept) {
           ringtone.startIncoming();
         }
         const nextSession: ActiveCallSession = {
@@ -296,11 +325,14 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           direction: 'incoming',
           callType: inc.callType,
           peer: inc.caller,
-          phase: 'ringing',
+          phase: shouldAutoAccept ? 'connecting' : 'ringing',
           startedAt: inc.startedAt || Date.now(),
         };
         callSessionRef.current = nextSession;
         setCallSession(nextSession);
+        if (shouldAutoAccept) {
+          void acceptIncomingCallRef.current(nextSession);
+        }
       }
     } catch {
       // Ignore transient check errors
@@ -310,15 +342,53 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   useEffect(() => {
     if (!user) return;
     checkPendingIncomingCall();
+
+    const verifyWsLiveness = () => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        reconnectWsRef.current?.();
+        return;
+      }
+      const probeSentAt = Date.now();
+      try {
+        ws.send(JSON.stringify({ type: 'ping' }));
+      } catch {
+        reconnectWsRef.current?.();
+        return;
+      }
+      if (pongCheckTimerRef.current !== null) {
+        window.clearTimeout(pongCheckTimerRef.current);
+      }
+      pongCheckTimerRef.current = window.setTimeout(() => {
+        pongCheckTimerRef.current = null;
+        if (lastPongAtRef.current < probeSentAt) {
+          reconnectWsRef.current?.();
+        }
+      }, 1200);
+    };
+
+    const onNativeAction = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ action?: string; callId?: string }>).detail;
+      if (detail?.action === 'accept' && detail.callId) {
+        pendingAcceptCallIdRef.current = detail.callId;
+        verifyWsLiveness();
+        checkPendingIncomingCall();
+      }
+    };
+
     const onVisibleOrResume = () => {
       if (document.visibilityState !== 'hidden') {
+        verifyWsLiveness();
         refreshAllData();
         checkPendingIncomingCall();
       }
     };
+
+    window.addEventListener('easycall:native-action', onNativeAction);
     window.addEventListener('easycall:resume', onVisibleOrResume);
     document.addEventListener('visibilitychange', onVisibleOrResume);
     return () => {
+      window.removeEventListener('easycall:native-action', onNativeAction);
       window.removeEventListener('easycall:resume', onVisibleOrResume);
       document.removeEventListener('visibilitychange', onVisibleOrResume);
     };
@@ -337,6 +407,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       relayRef.current = null;
     }
     relayActiveRef.current = false;
+    setRelayActive(false);
     pendingOutIceRef.current = [];
     if (pcRef.current) {
       pcRef.current.onicecandidate = null;
@@ -383,6 +454,8 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true,
+            sampleRate: 48000,
+            channelCount: 1,
           },
           video: videoConstraints,
         });
@@ -416,6 +489,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         return;
       }
       relayActiveRef.current = true;
+      setRelayActive(true);
       if (relayFallbackTimerRef.current !== null) {
         window.clearTimeout(relayFallbackTimerRef.current);
         relayFallbackTimerRef.current = null;
@@ -516,7 +590,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         } catch {
           // Ignore stats errors
         }
-      }, 4200);
+      }, 5000);
     },
     [activateMediaRelay]
   );
@@ -634,18 +708,37 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
     const connectWs = () => {
       if (disposed) return;
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      const prev = wsRef.current;
+      if (prev && (prev.readyState === WebSocket.OPEN || prev.readyState === WebSocket.CONNECTING)) {
+        try {
+          prev.onclose = null;
+          prev.close();
+        } catch {
+          // Ignore close errors
+        }
+      }
       const ws = new WebSocket(buildWsUrl());
       wsRef.current = ws;
 
       ws.onopen = () => {
+        lastPongAtRef.current = Date.now();
         if (!disposed) setWsConnected(true);
       };
 
       ws.onmessage = async (event) => {
+        lastPongAtRef.current = Date.now();
         let msg: Record<string, unknown>;
         try {
           msg = JSON.parse(String(event.data));
         } catch {
+          return;
+        }
+
+        if (msg.type === 'pong') {
           return;
         }
 
@@ -663,6 +756,18 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
                 })
               );
             }
+          }
+          if (
+            callSessionRef.current &&
+            callSessionRef.current.callId !== 'pending' &&
+            ws.readyState === WebSocket.OPEN
+          ) {
+            ws.send(
+              JSON.stringify({
+                type: 'call:sync',
+                callId: callSessionRef.current.callId,
+              })
+            );
           }
         } else if (msg.type === 'presence:update') {
           const uid = String(msg.userId);
@@ -704,18 +809,25 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             }
             return;
           }
-          ringtone.startIncoming();
+          const shouldAutoAccept = pendingAcceptCallIdRef.current === callId;
+          if (shouldAutoAccept) {
+            pendingAcceptCallIdRef.current = null;
+          } else {
+            ringtone.startIncoming();
+          }
           const nextSession: ActiveCallSession = {
             callId,
             direction: 'incoming',
             callType,
             peer: caller,
-            phase: 'ringing',
+            phase: shouldAutoAccept ? 'connecting' : 'ringing',
             startedAt: Date.now(),
           };
           callSessionRef.current = nextSession;
           setCallSession(nextSession);
-          if ('Notification' in window && Notification.permission === 'granted') {
+          if (shouldAutoAccept) {
+            void acceptIncomingCallRef.current(nextSession);
+          } else if ('Notification' in window && Notification.permission === 'granted') {
             try {
               new Notification(`Incoming ${callType} call`, {
                 body: `${caller.displayName} is calling you on EASY CALL`,
@@ -730,6 +842,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           if (!current || current.callId !== callId) return;
           ringtone.stop();
           stopNativeRinging();
+          if (current.direction !== 'outgoing' || pcRef.current) return;
           setNativeCallAudioMode(true, speakerOnRef.current);
           setCallSession((prev) => (prev ? { ...prev, phase: 'connecting' } : prev));
 
@@ -815,23 +928,29 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       ws.onclose = () => {
         if (!disposed) {
           setWsConnected(false);
-          reconnectTimer = window.setTimeout(connectWs, 2500);
+          reconnectTimer = window.setTimeout(connectWs, 1200);
         }
       };
     };
 
+    reconnectWsRef.current = connectWs;
     connectWs();
 
     const pingInterval = window.setInterval(() => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: 'ping' }));
       }
-    }, 25000);
+    }, 15000);
 
     return () => {
       disposed = true;
+      reconnectWsRef.current = null;
       setWsConnected(false);
       clearInterval(pingInterval);
+      if (pongCheckTimerRef.current !== null) {
+        clearTimeout(pongCheckTimerRef.current);
+        pongCheckTimerRef.current = null;
+      }
       if (reconnectTimer) clearTimeout(reconnectTimer);
       wsRef.current?.close();
       wsRef.current = null;
@@ -896,60 +1015,76 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     }
   };
 
-  const acceptIncomingCall = async () => {
-    const current = callSessionRef.current;
-    if (!current) return;
-    ringtone.stop();
-    stopNativeRinging();
-    setNativeCallAudioMode(true, speakerOnRef.current);
-    try {
-      const AC =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const u = new AC();
-      u.resume().finally(() => u.close().catch(() => {}));
-    } catch {
-      // Ignore AudioContext unlock errors
-    }
-    const connectingSession: ActiveCallSession = { ...current, phase: 'connecting' };
-    callSessionRef.current = connectingSession;
-    setCallSession(connectingSession);
-
-    await acquireUserMedia(current.callType, 'user');
-    if (!callSessionRef.current || callSessionRef.current.callId !== current.callId) {
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((tr) => tr.stop());
-        localStreamRef.current = null;
+  const acceptIncomingCall = useCallback(
+    async (explicitSession?: ActiveCallSession) => {
+      const current = explicitSession || callSessionRef.current;
+      if (!current || pcRef.current) return;
+      ringtone.stop();
+      stopNativeRinging();
+      setNativeCallAudioMode(true, speakerOnRef.current);
+      try {
+        const AC =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        const u = new AC();
+        u.resume().finally(() => u.close().catch(() => {}));
+      } catch {
+        // Ignore AudioContext unlock errors
       }
-      return;
-    }
+      const connectingSession: ActiveCallSession = { ...current, phase: 'connecting' };
+      callSessionRef.current = connectingSession;
+      setCallSession(connectingSession);
 
-    const pc = createPeerConnection(current.callId, current.peer.id, current.callType, false);
-    scheduleRelayFallback(current.callId, current.peer.id, current.callType);
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'call:accept', callId: current.callId }));
-    }
-
-    if (pendingOfferRef.current && pendingOfferRef.current.callId === current.callId) {
-      const { sdp, fromUserId } = pendingOfferRef.current;
-      pendingOfferRef.current = null;
-      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-      for (const cand of pendingIceRef.current) {
-        await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+      // Immediately accept via BOTH WebSocket and HTTP so caller never misses acceptance
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'call:accept', callId: current.callId }));
+      } else {
+        reconnectWsRef.current?.();
       }
-      pendingIceRef.current = [];
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      wsRef.current?.send(
-        JSON.stringify({
-          type: 'webrtc:answer',
-          callId: current.callId,
-          targetUserId: fromUserId,
-          sdp: pc.localDescription,
-        })
-      );
-    }
-  };
+      apiFetch(`/api/calls/${encodeURIComponent(current.callId)}/accept`, {
+        method: 'POST',
+      }).catch(() => {});
+
+      await acquireUserMedia(current.callType, 'user');
+      if (!callSessionRef.current || callSessionRef.current.callId !== current.callId) {
+        if (localStreamRef.current) {
+          localStreamRef.current.getTracks().forEach((tr) => tr.stop());
+          localStreamRef.current = null;
+        }
+        return;
+      }
+
+      const pc = createPeerConnection(current.callId, current.peer.id, current.callType, false);
+      scheduleRelayFallback(current.callId, current.peer.id, current.callType);
+
+      if (pendingOfferRef.current && pendingOfferRef.current.callId === current.callId) {
+        const { sdp, fromUserId } = pendingOfferRef.current;
+        pendingOfferRef.current = null;
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        for (const cand of pendingIceRef.current) {
+          await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+        }
+        pendingIceRef.current = [];
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        wsRef.current?.send(
+          JSON.stringify({
+            type: 'webrtc:answer',
+            callId: current.callId,
+            targetUserId: fromUserId,
+            sdp: pc.localDescription,
+          })
+        );
+      } else if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'call:sync', callId: current.callId }));
+      }
+    },
+    [acquireUserMedia, createPeerConnection, scheduleRelayFallback]
+  );
+
+  useEffect(() => {
+    acceptIncomingCallRef.current = acceptIncomingCall;
+  }, [acceptIncomingCall]);
 
   const rejectIncomingCall = () => {
     const current = callSessionRef.current;
@@ -1326,7 +1461,8 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         durationSec={callDurationSec}
         mediaError={mediaError}
         relayVideoFrame={relayVideoFrame}
-        onAccept={acceptIncomingCall}
+        relayActive={relayActive}
+        onAccept={() => acceptIncomingCall()}
         onReject={rejectIncomingCall}
         onEnd={endActiveCall}
         onToggleMute={toggleMute}

@@ -37,6 +37,7 @@ interface CallOverlayProps {
   durationSec: number;
   mediaError: string | null;
   relayVideoFrame?: string | null;
+  relayActive?: boolean;
   onAccept: () => void;
   onReject: () => void;
   onEnd: () => void;
@@ -64,6 +65,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   durationSec,
   mediaError,
   relayVideoFrame,
+  relayActive = false,
   onAccept,
   onReject,
   onEnd,
@@ -91,9 +93,11 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
         if (remoteAudioRef.current.srcObject !== remoteStream) {
           remoteAudioRef.current.srcObject = remoteStream;
         }
-        remoteAudioRef.current.muted = false;
+        remoteAudioRef.current.muted = relayActive;
         remoteAudioRef.current.volume = isNative ? 1 : speakerOn ? 1 : 0.45;
-        remoteAudioRef.current.play().catch(() => {});
+        if (!relayActive) {
+          remoteAudioRef.current.play().catch(() => {});
+        }
       }
     };
 
@@ -104,7 +108,7 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
     return () => {
       remoteStream.removeEventListener('addtrack', syncRemotePlayback);
     };
-  }, [remoteStream, speakerOn, session?.callId, isNative]);
+  }, [remoteStream, speakerOn, session?.callId, isNative, relayActive]);
 
   useEffect(() => {
     if (localVideoRef.current && localStream) {

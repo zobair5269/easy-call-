@@ -321,7 +321,7 @@ export async function compileDirectAndroidApk(
     android:versionCode="${cfg.versionCode}"
     android:versionName="${sanitizeXmlText(cfg.versionName)}">
 
-    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="33" />
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -331,9 +331,11 @@ export async function compileDirectAndroidApk(
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
@@ -361,11 +363,30 @@ export async function compileDirectAndroidApk(
             </intent-filter>
         </activity>
 
+        <activity
+            android:name="${sanitizeXmlText(cfg.applicationId)}.IncomingCallActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:excludeFromRecents="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
+
         <service
             android:name="${sanitizeXmlText(cfg.applicationId)}.EasyCallService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <service
+            android:name="${sanitizeXmlText(cfg.applicationId)}.EasyCallConnectionService"
+            android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.telecom.ConnectionService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>
 `,
@@ -382,7 +403,9 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.app.Person;
 import android.app.Service;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -391,12 +414,20 @@ import android.media.AudioAttributes;
 import android.media.MediaPlayer;
 import android.media.Ringtone;
 import android.media.RingtoneManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.telecom.PhoneAccount;
+import android.telecom.PhoneAccountHandle;
+import android.telecom.TelecomManager;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
@@ -412,7 +443,8 @@ public class EasyCallService extends Service {
 
     private static final String CHANNEL_BG = "easycall_bg_sync";
     private static final String CHANNEL_MSG = "easycall_messages";
-    private static final String CHANNEL_CALL = "easycall_incoming_calls";
+    private static final String CHANNEL_CALL = "easycall_incoming_calls_v2";
+    private static final String TELECOM_ACCOUNT_ID = "easycall_self_managed";
     private static final int FG_NOTIF_ID = 101;
     private static final int CALL_NOTIF_ID = 202;
 
@@ -421,15 +453,20 @@ public class EasyCallService extends Service {
     private static volatile Ringtone activeRingtone = null;
     private static volatile Vibrator activeVibrator = null;
     private static volatile String activeRingingCallId = null;
+    private static volatile String presentedCallId = null;
 
     private volatile boolean running = false;
+    private volatile HttpURLConnection activeConn = null;
     private Thread workerThread = null;
+    private ConnectivityManager.NetworkCallback netCallback = null;
     private int msgNotifSeq = 300;
 
     @Override
     public void onCreate() {
         super.onCreate();
         ensureChannels();
+        ensurePhoneAccount(this);
+        registerNetworkWatcher();
     }
 
     @Override
@@ -443,6 +480,8 @@ public class EasyCallService extends Service {
         } else if (ACTION_DECLINE_CALL.equals(action)) {
             final String callId = intent.getStringExtra(EXTRA_CALL_ID);
             stopRingingStatic(this);
+            IncomingCallActivity.dismissIfCallMatches(callId);
+            EasyCallConnectionService.endTelecomCall(callId);
             if (callId != null && !callId.isEmpty()) {
                 declineCallAsync(callId);
             }
@@ -473,7 +512,15 @@ public class EasyCallService extends Service {
     @Override
     public void onDestroy() {
         running = false;
+        unregisterNetworkWatcher();
         stopRingingStatic(this);
+        if (activeConn != null) {
+            try {
+                activeConn.disconnect();
+            } catch (Throwable ignored) {
+            }
+            activeConn = null;
+        }
         if (workerThread != null) {
             workerThread.interrupt();
             workerThread = null;
@@ -484,6 +531,46 @@ public class EasyCallService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    private void registerNetworkWatcher() {
+        if (Build.VERSION.SDK_INT < 24) return;
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return;
+            netCallback = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    // Force immediate reconnect if stream was idling on stale interface
+                    final HttpURLConnection c = activeConn;
+                    if (c != null) {
+                        new Thread(new Runnable() {
+                            @Override
+                            public void run() {
+                                try {
+                                    c.disconnect();
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        }).start();
+                    }
+                }
+            };
+            cm.registerDefaultNetworkCallback(netCallback);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void unregisterNetworkWatcher() {
+        if (Build.VERSION.SDK_INT < 24 || netCallback == null) return;
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null) {
+                cm.unregisterNetworkCallback(netCallback);
+            }
+        } catch (Throwable ignored) {
+        }
+        netCallback = null;
     }
 
     private void startForegroundCompat() {
@@ -519,18 +606,20 @@ public class EasyCallService extends Service {
         bg.enableVibration(false);
         nm.createNotificationChannel(bg);
 
-        NotificationChannel msg = new NotificationChannel(CHANNEL_MSG, "Messages & Friend Requests", NotificationManager.IMPORTANCE_HIGH);
+        NotificationChannel msg = new NotificationChannel(CHANNEL_MSG, "Messages & Alerts", NotificationManager.IMPORTANCE_HIGH);
         msg.enableVibration(true);
         nm.createNotificationChannel(msg);
 
-        NotificationChannel call = new NotificationChannel(CHANNEL_CALL, "Incoming Calls", NotificationManager.IMPORTANCE_HIGH);
+        NotificationChannel call = new NotificationChannel(CHANNEL_CALL, "Incoming Calls (Full Screen)", NotificationManager.IMPORTANCE_HIGH);
         call.setSound(null, null);
         call.enableVibration(false);
+        call.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+        call.setBypassDnd(true);
         nm.createNotificationChannel(call);
     }
 
     private void runSseLoop() {
-        int backoffMs = 2000;
+        int backoffMs = 500;
         while (running) {
             HttpURLConnection conn = null;
             try {
@@ -545,12 +634,13 @@ public class EasyCallService extends Service {
 
                 URL url = new URL(serverUrl + "/api/events/stream");
                 conn = (HttpURLConnection) url.openConnection();
+                activeConn = conn;
                 conn.setRequestMethod("GET");
                 conn.setRequestProperty("Authorization", "Bearer " + token);
                 conn.setRequestProperty("Accept", "text/event-stream");
                 conn.setRequestProperty("X-Requested-With", "EasyCallClient");
-                conn.setConnectTimeout(15000);
-                conn.setReadTimeout(45000);
+                conn.setConnectTimeout(10000);
+                conn.setReadTimeout(18000);
 
                 int code = conn.getResponseCode();
                 if (code == 401) {
@@ -563,7 +653,7 @@ public class EasyCallService extends Service {
                     throw new RuntimeException("HTTP " + code);
                 }
 
-                backoffMs = 2000;
+                backoffMs = 500;
                 BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"));
                 String line;
                 while (running && (line = reader.readLine()) != null) {
@@ -576,6 +666,9 @@ public class EasyCallService extends Service {
                 }
             } catch (Throwable ignored) {
             } finally {
+                if (activeConn == conn) {
+                    activeConn = null;
+                }
                 if (conn != null) {
                     try {
                         conn.disconnect();
@@ -590,7 +683,7 @@ public class EasyCallService extends Service {
             } catch (InterruptedException e) {
                 break;
             }
-            backoffMs = Math.min(12000, backoffMs * 2);
+            backoffMs = Math.min(4000, backoffMs * 2);
         }
     }
 
@@ -602,15 +695,24 @@ public class EasyCallService extends Service {
                 String callId = obj.optString("callId", "");
                 String callType = obj.optString("callType", "audio");
                 JSONObject caller = obj.optJSONObject("caller");
-                String callerName = caller != null ? caller.optString("displayName", "Incoming Call") : "Incoming Call";
-                if (callerName.isEmpty() && caller != null) {
-                    callerName = caller.optString("phoneE164", "Incoming Call");
+                String callerName = caller != null ? caller.optString("displayName", "") : "";
+                String callerPhone = caller != null ? caller.optString("phoneE164", "") : "";
+                if (callerName.isEmpty()) {
+                    callerName = !callerPhone.isEmpty() ? callerPhone : "Incoming Call";
                 }
-                if (!isAppForeground && !callId.equals(activeRingingCallId)) {
-                    showIncomingCallAlert(callId, callerName, "video".equals(callType));
+                if (!isAppForeground && !callId.isEmpty() && !callId.equals(activeRingingCallId)) {
+                    showIncomingCallAlert(callId, callerName, callerPhone, "video".equals(callType));
                 }
             } else if ("call:ended".equals(type) || "call:rejected".equals(type)) {
+                String callId = obj.optString("callId", "");
                 stopRingingStatic(this);
+                IncomingCallActivity.dismissIfCallMatches(callId);
+                EasyCallConnectionService.endTelecomCall(callId);
+            } else if ("call:accepted".equals(type)) {
+                String callId = obj.optString("callId", "");
+                stopRingingStatic(this);
+                IncomingCallActivity.dismissIfCallMatches(callId);
+                EasyCallConnectionService.setTelecomCallActive(callId);
             } else if ("chat:message".equals(type)) {
                 if (!isAppForeground) {
                     String senderName = obj.optString("senderName", "EASY CALL");
@@ -625,61 +727,179 @@ public class EasyCallService extends Service {
                 if (!isAppForeground) {
                     JSONObject fromUser = obj.optJSONObject("fromUser");
                     String name = fromUser != null ? fromUser.optString("displayName", "Someone") : "Someone";
-                    showMessageNotification("New Friend Request", name + " wants to connect on EASY CALL");
+                    showMessageNotification("New Connection", name + " wants to connect on EASY CALL");
                 }
             }
         } catch (Throwable ignored) {
         }
     }
 
-    private void showIncomingCallAlert(String callId, String callerName, boolean isVideo) {
+    public static PhoneAccountHandle getPhoneAccountHandle(Context ctx) {
+        ComponentName cn = new ComponentName(ctx, EasyCallConnectionService.class);
+        return new PhoneAccountHandle(cn, TELECOM_ACCOUNT_ID);
+    }
+
+    public static void ensurePhoneAccount(Context ctx) {
+        if (Build.VERSION.SDK_INT < 26) return;
+        try {
+            TelecomManager tm = (TelecomManager) ctx.getSystemService(Context.TELECOM_SERVICE);
+            if (tm == null) return;
+            PhoneAccountHandle handle = getPhoneAccountHandle(ctx);
+            PhoneAccount account = new PhoneAccount.Builder(handle, "EASY CALL")
+                .setCapabilities(PhoneAccount.CAPABILITY_SELF_MANAGED)
+                .addSupportedUriScheme(PhoneAccount.SCHEME_SIP)
+                .build();
+            tm.registerPhoneAccount(account);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private void showIncomingCallAlert(final String callId, final String callerName, final String callerPhone, final boolean isVideo) {
         activeRingingCallId = callId;
+        presentedCallId = null;
         startRinging();
 
+        // Wake CPU and physically turn ON the locked screen display
         try {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
             if (pm != null) {
-                PowerManager.WakeLock wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "easycall:incoming");
-                wl.acquire(15000);
+                try {
+                    PowerManager.WakeLock screenWl = pm.newWakeLock(
+                        PowerManager.SCREEN_BRIGHT_WAKE_LOCK
+                            | PowerManager.ACQUIRE_CAUSES_WAKEUP
+                            | PowerManager.ON_AFTER_RELEASE,
+                        "easycall:screen_wake"
+                    );
+                    screenWl.acquire(15000);
+                } catch (Throwable ignored) {
+                    PowerManager.WakeLock cpuWl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "easycall:incoming");
+                    cpuWl.acquire(15000);
+                }
             }
         } catch (Throwable ignored) {
         }
 
-        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        // Use Android Telecom Self-Managed ConnectionService on API 26+ (same path as WhatsApp / imo / Messenger)
+        // This gives OS-granted background activity launch & floating CallStyle heads-up without needing Draw Over Apps.
+        boolean telecomTriggered = false;
+        if (Build.VERSION.SDK_INT >= 26) {
+            try {
+                ensurePhoneAccount(this);
+                TelecomManager tm = (TelecomManager) getSystemService(Context.TELECOM_SERVICE);
+                if (tm != null) {
+                    Bundle extras = new Bundle();
+                    extras.putString("callId", callId);
+                    extras.putString("callerName", callerName);
+                    extras.putString("callerPhone", callerPhone);
+                    extras.putBoolean("isVideo", isVideo);
+                    tm.addNewIncomingCall(getPhoneAccountHandle(this), extras);
+                    telecomTriggered = true;
+                }
+            } catch (Throwable ignored) {
+                telecomTriggered = false;
+            }
+        }
+
+        if (telecomTriggered) {
+            // Safety fallback if Telecom delays onShowIncomingCallUi() on certain OEM ROMs
+            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (callId.equals(activeRingingCallId) && !callId.equals(presentedCallId)) {
+                        presentIncomingCallUiStatic(EasyCallService.this, callId, callerName, callerPhone, isVideo);
+                    }
+                }
+            }, 250);
+        } else {
+            presentIncomingCallUiStatic(this, callId, callerName, callerPhone, isVideo);
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    public static synchronized void presentIncomingCallUiStatic(
+        Context ctx,
+        String callId,
+        String callerName,
+        String callerPhone,
+        boolean isVideo
+    ) {
+        if (callId == null || callId.isEmpty() || !callId.equals(activeRingingCallId)) {
+            return;
+        }
+        if (callId.equals(presentedCallId)) {
+            return;
+        }
+        presentedCallId = callId;
+
+        NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm == null) return;
 
         int piFlags = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
 
-        Intent fullIntent = new Intent(this, MainActivity.class);
-        fullIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-        fullIntent.putExtra("incomingCallId", callId);
-        PendingIntent fullPi = PendingIntent.getActivity(this, 21, fullIntent, piFlags);
+        Intent fullScreenIntent = new Intent(ctx, IncomingCallActivity.class);
+        fullScreenIntent.setFlags(
+            Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                | Intent.FLAG_ACTIVITY_SINGLE_TOP
+                | Intent.FLAG_ACTIVITY_NO_USER_ACTION
+        );
+        fullScreenIntent.putExtra("callId", callId);
+        fullScreenIntent.putExtra("callerName", callerName);
+        fullScreenIntent.putExtra("callerPhone", callerPhone);
+        fullScreenIntent.putExtra("isVideo", isVideo);
+        PendingIntent fullScreenPi = PendingIntent.getActivity(ctx, 21, fullScreenIntent, piFlags);
 
-        Intent declineIntent = new Intent(this, EasyCallService.class);
+        Intent answerIntent = new Intent(ctx, MainActivity.class);
+        answerIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        answerIntent.putExtra("incomingCallId", callId);
+        answerIntent.putExtra("autoAcceptCallId", callId);
+        PendingIntent answerPi = PendingIntent.getActivity(ctx, 23, answerIntent, piFlags);
+
+        Intent declineIntent = new Intent(ctx, EasyCallService.class);
         declineIntent.setAction(ACTION_DECLINE_CALL);
         declineIntent.putExtra(EXTRA_CALL_ID, callId);
-        PendingIntent declinePi = PendingIntent.getService(this, 22, declineIntent, piFlags);
+        PendingIntent declinePi = PendingIntent.getService(ctx, 22, declineIntent, piFlags);
 
         Notification.Builder nb = Build.VERSION.SDK_INT >= 26
-            ? new Notification.Builder(this, CHANNEL_CALL)
-            : new Notification.Builder(this);
+            ? new Notification.Builder(ctx, CHANNEL_CALL)
+            : new Notification.Builder(ctx);
 
         nb.setSmallIcon(R.mipmap.ic_launcher)
-          .setContentTitle(isVideo ? "Incoming Video Call" : "Incoming Audio Call")
-          .setContentText(callerName + " is calling...")
+          .setContentTitle(callerName)
+          .setContentText(isVideo ? "Incoming video call" : "Incoming audio call")
           .setPriority(Notification.PRIORITY_MAX)
           .setCategory(Notification.CATEGORY_CALL)
+          .setVisibility(Notification.VISIBILITY_PUBLIC)
+          .setColor(0xFF0F766E)
           .setOngoing(true)
-          .setAutoCancel(true)
-          .setContentIntent(fullPi)
-          .setFullScreenIntent(fullPi, true)
-          .addAction(0, "Answer", fullPi)
-          .addAction(0, "Decline", declinePi);
+          .setAutoCancel(false)
+          .setContentIntent(fullScreenPi)
+          .setFullScreenIntent(fullScreenPi, true);
+
+        if (Build.VERSION.SDK_INT >= 31) {
+            try {
+                Person callerPerson = new Person.Builder()
+                    .setName(callerName)
+                    .setImportant(true)
+                    .build();
+                Notification.CallStyle callStyle = Notification.CallStyle
+                    .forIncomingCall(callerPerson, declinePi, answerPi)
+                    .setIsVideo(isVideo);
+                nb.setStyle(callStyle);
+            } catch (Throwable ignored) {
+                nb.addAction(0, "Decline", declinePi)
+                  .addAction(0, "Answer", answerPi);
+            }
+        } else {
+            nb.addAction(0, "Decline", declinePi)
+              .addAction(0, "Answer", answerPi);
+        }
 
         nm.notify(CALL_NOTIF_ID, nb.build());
 
         try {
-            startActivity(fullIntent);
+            ctx.startActivity(fullScreenIntent);
         } catch (Throwable ignored) {
         }
     }
@@ -782,6 +1002,7 @@ public class EasyCallService extends Service {
 
     public static void stopRingingStatic(Context ctx) {
         activeRingingCallId = null;
+        presentedCallId = null;
         try {
             if (activeMediaPlayer != null) {
                 if (activeMediaPlayer.isPlaying()) {
@@ -815,12 +1036,13 @@ public class EasyCallService extends Service {
         }
     }
 
-    private void declineCallAsync(final String callId) {
+    public static void declineCallStatic(final Context ctx, final String callId) {
+        if (callId == null || callId.isEmpty()) return;
         new Thread(new Runnable() {
             @Override
             public void run() {
                 try {
-                    SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                    SharedPreferences prefs = ctx.getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
                     String serverUrl = prefs.getString("serverUrl", "").replaceAll("/+$", "");
                     String token = prefs.getString("authToken", "");
                     if (serverUrl.isEmpty() || token.isEmpty()) return;
@@ -838,6 +1060,477 @@ public class EasyCallService extends Service {
             }
         }).start();
     }
+
+    private void declineCallAsync(final String callId) {
+        declineCallStatic(this, callId);
+    }
+}
+`,
+      'utf8'
+    );
+
+    // 5a. Write EasyCallConnectionService.java (Android Telecom self-managed VoIP service for WhatsApp/imo-style incoming calls)
+    const connectionServicePath = path.join(srcDir, 'EasyCallConnectionService.java');
+    fs.writeFileSync(
+      connectionServicePath,
+      `package ${cfg.applicationId};
+
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.telecom.Connection;
+import android.telecom.ConnectionRequest;
+import android.telecom.ConnectionService;
+import android.telecom.DisconnectCause;
+import android.telecom.PhoneAccountHandle;
+import android.telecom.TelecomManager;
+
+public class EasyCallConnectionService extends ConnectionService {
+    private static volatile EasyCallConnection activeConnection = null;
+    private static volatile String activeCallId = null;
+
+    public static void setTelecomCallActive(String callId) {
+        if (Build.VERSION.SDK_INT < 26) return;
+        final EasyCallConnection conn = activeConnection;
+        if (conn == null) return;
+        if (callId == null || callId.isEmpty() || callId.equals(activeCallId)) {
+            try {
+                conn.setActive();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    public static void endTelecomCall(String callId) {
+        if (Build.VERSION.SDK_INT < 26) return;
+        final EasyCallConnection conn = activeConnection;
+        if (conn == null) return;
+        if (callId == null || callId.isEmpty() || callId.equals(activeCallId)) {
+            activeConnection = null;
+            activeCallId = null;
+            try {
+                conn.setDisconnected(new DisconnectCause(DisconnectCause.REMOTE));
+                conn.destroy();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static Bundle extractCallExtras(ConnectionRequest request) {
+        Bundle b = request != null ? request.getExtras() : null;
+        if (b == null) return new Bundle();
+        if (b.containsKey("callId")) return b;
+        try {
+            Bundle nested = b.getBundle(TelecomManager.EXTRA_INCOMING_CALL_EXTRAS);
+            if (nested != null) return nested;
+        } catch (Throwable ignored) {
+        }
+        return b;
+    }
+
+    @Override
+    public Connection onCreateIncomingConnection(PhoneAccountHandle connectionManagerPhoneAccount, ConnectionRequest request) {
+        Bundle extras = extractCallExtras(request);
+        String callId = extras.getString("callId", "");
+        String callerName = extras.getString("callerName", "Incoming Call");
+        String callerPhone = extras.getString("callerPhone", "");
+        boolean isVideo = extras.getBoolean("isVideo", false);
+
+        EasyCallConnection conn = new EasyCallConnection(callId, callerName, callerPhone, isVideo);
+        if (Build.VERSION.SDK_INT >= 26) {
+            conn.setConnectionProperties(Connection.PROPERTY_SELF_MANAGED);
+            conn.setAudioModeIsVoip(true);
+        }
+        String addressVal = !callerPhone.isEmpty() ? callerPhone : (!callId.isEmpty() ? callId : "easycall");
+        conn.setAddress(Uri.fromParts("sip", addressVal, null), TelecomManager.PRESENTATION_ALLOWED);
+        conn.setCallerDisplayName(callerName, TelecomManager.PRESENTATION_ALLOWED);
+        conn.setInitializing();
+        conn.setInitialized();
+        conn.setRinging();
+
+        activeConnection = conn;
+        activeCallId = callId;
+        return conn;
+    }
+
+    @Override
+    public void onCreateIncomingConnectionFailed(PhoneAccountHandle connectionManagerPhoneAccount, ConnectionRequest request) {
+        Bundle extras = extractCallExtras(request);
+        String callId = extras.getString("callId", "");
+        String callerName = extras.getString("callerName", "Incoming Call");
+        String callerPhone = extras.getString("callerPhone", "");
+        boolean isVideo = extras.getBoolean("isVideo", false);
+        EasyCallService.presentIncomingCallUiStatic(getApplicationContext(), callId, callerName, callerPhone, isVideo);
+    }
+
+    private class EasyCallConnection extends Connection {
+        private final String callId;
+        private final String callerName;
+        private final String callerPhone;
+        private final boolean isVideo;
+
+        EasyCallConnection(String callId, String callerName, String callerPhone, boolean isVideo) {
+            this.callId = callId;
+            this.callerName = callerName;
+            this.callerPhone = callerPhone;
+            this.isVideo = isVideo;
+        }
+
+        @Override
+        public void onShowIncomingCallUi() {
+            EasyCallService.presentIncomingCallUiStatic(
+                getApplicationContext(),
+                callId,
+                callerName,
+                callerPhone,
+                isVideo
+            );
+        }
+
+        @Override
+        public void onAnswer() {
+            handleAnswer();
+        }
+
+        @Override
+        public void onAnswer(int videoState) {
+            handleAnswer();
+        }
+
+        private void handleAnswer() {
+            EasyCallService.stopRingingStatic(getApplicationContext());
+            try {
+                setActive();
+            } catch (Throwable ignored) {
+            }
+            try {
+                Intent main = new Intent(getApplicationContext(), MainActivity.class);
+                main.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                main.putExtra("incomingCallId", callId);
+                main.putExtra("autoAcceptCallId", callId);
+                getApplicationContext().startActivity(main);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        @Override
+        public void onReject() {
+            handleReject();
+        }
+
+        @Override
+        public void onReject(int rejectReason) {
+            handleReject();
+        }
+
+        @Override
+        public void onReject(String replyMessage) {
+            handleReject();
+        }
+
+        private void handleReject() {
+            EasyCallService.stopRingingStatic(getApplicationContext());
+            IncomingCallActivity.dismissIfCallMatches(callId);
+            EasyCallService.declineCallStatic(getApplicationContext(), callId);
+            if (activeConnection == this) {
+                activeConnection = null;
+                activeCallId = null;
+            }
+            try {
+                setDisconnected(new DisconnectCause(DisconnectCause.REJECTED));
+                destroy();
+            } catch (Throwable ignored) {
+            }
+        }
+
+        @Override
+        public void onDisconnect() {
+            if (activeConnection == this) {
+                activeConnection = null;
+                activeCallId = null;
+            }
+            try {
+                setDisconnected(new DisconnectCause(DisconnectCause.LOCAL));
+                destroy();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+}
+`,
+      'utf8'
+    );
+
+    // 5b. Write IncomingCallActivity.java (instant native lock-screen & pop-up call UI)
+    const incomingCallPath = path.join(srcDir, 'IncomingCallActivity.java');
+    fs.writeFileSync(
+      incomingCallPath,
+      `package ${cfg.applicationId};
+
+import android.app.Activity;
+import android.app.KeyguardManager;
+import android.content.Context;
+import android.content.Intent;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.PowerManager;
+import android.view.Gravity;
+import android.view.View;
+import android.view.WindowManager;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+
+public class IncomingCallActivity extends Activity {
+    private static volatile IncomingCallActivity activeInstance = null;
+    private static volatile String activeCallId = null;
+
+    private String callId = "";
+    private PowerManager.WakeLock wakeLock = null;
+
+    public static void dismissIfCallMatches(final String endedCallId) {
+        final IncomingCallActivity inst = activeInstance;
+        if (inst == null) return;
+        if (endedCallId == null || endedCallId.isEmpty() || endedCallId.equals(activeCallId)) {
+            inst.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    if (!inst.isFinishing()) {
+                        inst.finish();
+                    }
+                }
+            });
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        if (Build.VERSION.SDK_INT >= 27) {
+            setShowWhenLocked(true);
+            setTurnScreenOn(true);
+        }
+        getWindow().addFlags(
+            WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
+                | WindowManager.LayoutParams.FLAG_ALLOW_LOCK_WHILE_SCREEN_ON
+        );
+
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                wakeLock = pm.newWakeLock(
+                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK
+                        | PowerManager.ACQUIRE_CAUSES_WAKEUP
+                        | PowerManager.ON_AFTER_RELEASE,
+                    "easycall:call_screen"
+                );
+                wakeLock.acquire(45000);
+            }
+        } catch (Throwable ignored) {
+        }
+
+        Intent intent = getIntent();
+        callId = intent != null && intent.getStringExtra("callId") != null ? intent.getStringExtra("callId") : "";
+        String callerName = intent != null && intent.getStringExtra("callerName") != null ? intent.getStringExtra("callerName") : "Incoming Call";
+        String callerPhone = intent != null && intent.getStringExtra("callerPhone") != null ? intent.getStringExtra("callerPhone") : "";
+        boolean isVideo = intent != null && intent.getBooleanExtra("isVideo", false);
+
+        activeInstance = this;
+        activeCallId = callId;
+
+        float dp = getResources().getDisplayMetrics().density;
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setGravity(Gravity.CENTER_HORIZONTAL);
+        GradientDrawable bg = new GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            new int[]{Color.parseColor("#0B1623"), Color.parseColor("#0D3331"), Color.parseColor("#09111B")}
+        );
+        root.setBackground(bg);
+        int padH = (int) (24 * dp);
+        int padTop = (int) (64 * dp);
+        int padBot = (int) (56 * dp);
+        root.setPadding(padH, padTop, padH, padBot);
+
+        TextView badge = new TextView(this);
+        badge.setText(isVideo ? "EASY CALL · INCOMING VIDEO CALL" : "EASY CALL · INCOMING AUDIO CALL");
+        badge.setTextColor(Color.parseColor("#5EEAD4"));
+        badge.setTextSize(12f);
+        badge.setTypeface(Typeface.DEFAULT_BOLD);
+        badge.setGravity(Gravity.CENTER);
+        root.addView(badge);
+
+        View topSpacer = new View(this);
+        topSpacer.setLayoutParams(new LinearLayout.LayoutParams(1, 0, 1f));
+        root.addView(topSpacer);
+
+        String initial = callerName.trim().isEmpty() ? "?" : callerName.trim().substring(0, 1).toUpperCase();
+        TextView avatar = new TextView(this);
+        avatar.setText(initial);
+        avatar.setTextColor(Color.WHITE);
+        avatar.setTextSize(42f);
+        avatar.setTypeface(Typeface.DEFAULT_BOLD);
+        avatar.setGravity(Gravity.CENTER);
+        GradientDrawable avatarBg = new GradientDrawable();
+        avatarBg.setShape(GradientDrawable.OVAL);
+        avatarBg.setColor(Color.parseColor("#0F766E"));
+        avatarBg.setStroke((int) (4 * dp), Color.parseColor("#2DD4BF"));
+        avatar.setBackground(avatarBg);
+        int avatarSize = (int) (124 * dp);
+        LinearLayout.LayoutParams avParams = new LinearLayout.LayoutParams(avatarSize, avatarSize);
+        avParams.bottomMargin = (int) (24 * dp);
+        avatar.setLayoutParams(avParams);
+        root.addView(avatar);
+
+        TextView nameTv = new TextView(this);
+        nameTv.setText(callerName);
+        nameTv.setTextColor(Color.WHITE);
+        nameTv.setTextSize(28f);
+        nameTv.setTypeface(Typeface.DEFAULT_BOLD);
+        nameTv.setGravity(Gravity.CENTER);
+        root.addView(nameTv);
+
+        if (!callerPhone.isEmpty() && !callerPhone.equals(callerName)) {
+            TextView phoneTv = new TextView(this);
+            phoneTv.setText(callerPhone);
+            phoneTv.setTextColor(Color.parseColor("#94A3B8"));
+            phoneTv.setTextSize(15f);
+            phoneTv.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams phParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            );
+            phParams.topMargin = (int) (6 * dp);
+            phoneTv.setLayoutParams(phParams);
+            root.addView(phoneTv);
+        }
+
+        TextView statusTv = new TextView(this);
+        statusTv.setText("Ringing...");
+        statusTv.setTextColor(Color.parseColor("#A7F3D0"));
+        statusTv.setTextSize(16f);
+        statusTv.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams stParams = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        stParams.topMargin = (int) (14 * dp);
+        statusTv.setLayoutParams(stParams);
+        root.addView(statusTv);
+
+        View botSpacer = new View(this);
+        botSpacer.setLayoutParams(new LinearLayout.LayoutParams(1, 0, 1.3f));
+        root.addView(botSpacer);
+
+        LinearLayout btnRow = new LinearLayout(this);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnRow.setGravity(Gravity.CENTER);
+        btnRow.setLayoutParams(new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ));
+
+        btnRow.addView(createActionButton("Decline", Color.parseColor("#E11D48"), dp, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                Intent declineSvc = new Intent(IncomingCallActivity.this, EasyCallService.class);
+                declineSvc.setAction(EasyCallService.ACTION_DECLINE_CALL);
+                declineSvc.putExtra(EasyCallService.EXTRA_CALL_ID, callId);
+                startService(declineSvc);
+                finish();
+            }
+        }));
+
+        View gap = new View(this);
+        gap.setLayoutParams(new LinearLayout.LayoutParams((int) (64 * dp), 1));
+        btnRow.addView(gap);
+
+        btnRow.addView(createActionButton("Answer", Color.parseColor("#059669"), dp, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                EasyCallService.stopRingingStatic(IncomingCallActivity.this);
+                EasyCallConnectionService.setTelecomCallActive(callId);
+                try {
+                    if (Build.VERSION.SDK_INT >= 26) {
+                        KeyguardManager km = (KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
+                        if (km != null) {
+                            km.requestDismissKeyguard(IncomingCallActivity.this, null);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                Intent main = new Intent(IncomingCallActivity.this, MainActivity.class);
+                main.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                main.putExtra("incomingCallId", callId);
+                main.putExtra("autoAcceptCallId", callId);
+                startActivity(main);
+                finish();
+            }
+        }));
+
+        root.addView(btnRow);
+        setContentView(root);
+    }
+
+    private LinearLayout createActionButton(String label, int circleColor, float dp, View.OnClickListener listener) {
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setGravity(Gravity.CENTER);
+        col.setOnClickListener(listener);
+
+        TextView circle = new TextView(this);
+        circle.setText("Decline".equals(label) ? "✕" : "✓");
+        circle.setTextColor(Color.WHITE);
+        circle.setTextSize(28f);
+        circle.setTypeface(Typeface.DEFAULT_BOLD);
+        circle.setGravity(Gravity.CENTER);
+        GradientDrawable gd = new GradientDrawable();
+        gd.setShape(GradientDrawable.OVAL);
+        gd.setColor(circleColor);
+        circle.setBackground(gd);
+        int size = (int) (74 * dp);
+        circle.setLayoutParams(new LinearLayout.LayoutParams(size, size));
+        col.addView(circle);
+
+        TextView txt = new TextView(this);
+        txt.setText(label);
+        txt.setTextColor(Color.WHITE);
+        txt.setTextSize(15f);
+        txt.setTypeface(Typeface.DEFAULT_BOLD);
+        txt.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        lp.topMargin = (int) (10 * dp);
+        txt.setLayoutParams(lp);
+        col.addView(txt);
+        return col;
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (activeInstance == this) {
+            activeInstance = null;
+            activeCallId = null;
+        }
+        try {
+            if (wakeLock != null && wakeLock.isHeld()) {
+                wakeLock.release();
+            }
+        } catch (Throwable ignored) {
+        }
+        super.onDestroy();
+    }
 }
 `,
       'utf8'
@@ -852,6 +1545,7 @@ public class EasyCallService extends Service {
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.KeyguardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -892,9 +1586,12 @@ public class MainActivity extends Activity {
     private static final int PERMISSION_REQUEST_CODE = 1001;
     private static final int FILE_CHOOSER_CODE = 1002;
 
+    private static volatile String pendingAutoAcceptCallId = "";
+
     private WebView webView;
     private ValueCallback<Uri[]> filePathCallback;
 
+    @SuppressWarnings("deprecation")
     @SuppressLint("SetJavaScriptEnabled")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -904,6 +1601,11 @@ public class MainActivity extends Activity {
             setShowWhenLocked(true);
             setTurnScreenOn(true);
         }
+        getWindow().addFlags(
+            WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+        );
+        handleCallLaunchIntent(getIntent());
 
         try {
             final FrameLayout root = new FrameLayout(this);
@@ -1106,8 +1808,34 @@ public class MainActivity extends Activity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        handleCallLaunchIntent(intent);
         if (webView != null) {
             webView.evaluateJavascript("window.dispatchEvent(new Event('easycall:resume'))", null);
+        }
+    }
+
+    private void handleCallLaunchIntent(Intent intent) {
+        if (intent == null) return;
+        String acceptId = intent.getStringExtra("autoAcceptCallId");
+        if (acceptId != null && !acceptId.trim().isEmpty()) {
+            pendingAutoAcceptCallId = acceptId.trim();
+            EasyCallService.stopRingingStatic(this);
+            try {
+                if (Build.VERSION.SDK_INT >= 26) {
+                    KeyguardManager km = (KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
+                    if (km != null) {
+                        km.requestDismissKeyguard(this, null);
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            if (webView != null) {
+                final String safeId = pendingAutoAcceptCallId.replace("'", "");
+                webView.evaluateJavascript(
+                    "window.dispatchEvent(new CustomEvent('easycall:native-action', { detail: { action: 'accept', callId: '" + safeId + "' } }))",
+                    null
+                );
+            }
         }
     }
 
@@ -1123,6 +1851,7 @@ public class MainActivity extends Activity {
                     .apply();
 
                 if (token != null && !token.trim().isEmpty()) {
+                    EasyCallService.ensurePhoneAccount(MainActivity.this);
                     Intent svc = new Intent(MainActivity.this, EasyCallService.class);
                     svc.setAction(EasyCallService.ACTION_START);
                     if (Build.VERSION.SDK_INT >= 26) {
@@ -1133,6 +1862,13 @@ public class MainActivity extends Activity {
                 }
             } catch (Throwable ignored) {
             }
+        }
+
+        @JavascriptInterface
+        public String consumePendingAcceptCallId() {
+            String val = pendingAutoAcceptCallId;
+            pendingAutoAcceptCallId = "";
+            return val != null ? val : "";
         }
 
         @JavascriptInterface
@@ -1161,6 +1897,7 @@ public class MainActivity extends Activity {
             }
         }
 
+        @SuppressWarnings("deprecation")
         @JavascriptInterface
         public void setCallAudioMode(final boolean inCall, final boolean speakerOn) {
             runOnUiThread(new Runnable() {
@@ -1170,16 +1907,20 @@ public class MainActivity extends Activity {
                         AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
                         if (am != null) {
                             if (inCall) {
+                                am.requestAudioFocus(null, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
                                 am.setMode(AudioManager.MODE_IN_COMMUNICATION);
                                 am.setSpeakerphoneOn(speakerOn);
                             } else {
                                 am.setSpeakerphoneOn(false);
                                 am.setMode(AudioManager.MODE_NORMAL);
+                                am.abandonAudioFocus(null);
                             }
                         }
                         if (inCall) {
+                            EasyCallConnectionService.setTelecomCallActive(null);
                             getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                         } else {
+                            EasyCallConnectionService.endTelecomCall(null);
                             getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                         }
                     } catch (Throwable ignored) {
@@ -1188,6 +1929,7 @@ public class MainActivity extends Activity {
             });
         }
 
+        @SuppressWarnings("deprecation")
         @JavascriptInterface
         public void setSpeakerphone(final boolean speakerOn) {
             runOnUiThread(new Runnable() {
@@ -1335,13 +2077,13 @@ public class MainActivity extends Activity {
       '--min-sdk-version',
       '24',
       '--target-sdk-version',
-      '34',
+      '33',
       '--auto-add-overlay',
     ]);
 
-    // 9. Compile Java sources (R.java + EasyCallService.java + MainActivity.java)
+    // 9. Compile Java sources (R.java + EasyCallService.java + EasyCallConnectionService.java + IncomingCallActivity.java + MainActivity.java)
     const rJavaPath = path.join(genDir, pkgRelPath, 'R.java');
-    const javaSources = [servicePath, mainActivityPath];
+    const javaSources = [servicePath, connectionServicePath, incomingCallPath, mainActivityPath];
     if (fs.existsSync(rJavaPath)) {
       javaSources.unshift(rJavaPath);
     }

@@ -29,6 +29,7 @@ import {
   verifySameOriginIfCookie,
 } from './security.ts';
 import {
+  acceptIncomingCallById,
   isUserOnline,
   registerBackgroundStream,
   rejectIncomingCallById,
@@ -1502,7 +1503,7 @@ export function createApiRouter(): Router {
       if (!res.writableEnded) {
         res.write(': ping\n\n');
       }
-    }, 20_000);
+    }, 9_000);
 
     req.on('close', () => {
       clearInterval(heartbeat);
@@ -1544,6 +1545,16 @@ export function createApiRouter(): Router {
         caller: getPublicUserView(caller, true),
       },
     });
+  });
+
+  router.post('/calls/:id/accept', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    const result = acceptIncomingCallById(req.params.id, user.id);
+    if (!result.ok) {
+      res.status(409).json({ ok: false, error: 'Call is no longer ringing.' });
+      return;
+    }
+    res.json({ ok: true, alreadyActive: Boolean(result.alreadyActive) });
   });
 
   router.post('/calls/:id/decline', requireAuth, (req: AuthedRequest, res) => {
