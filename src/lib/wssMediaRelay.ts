@@ -157,33 +157,67 @@ export class WssMediaRelay {
     isCameraOff: () => boolean,
     onSendVideo: (jpegDataUrl: string) => void
   ) {
+    if (this.offscreenVideo) {
+      try {
+        this.offscreenVideo.srcObject = null;
+        this.offscreenVideo.remove();
+      } catch {
+        // Ignore cleanup errors
+      }
+      this.offscreenVideo = null;
+    }
+
     const video = document.createElement('video');
     video.muted = true;
     video.playsInline = true;
+    video.autoplay = true;
+    video.setAttribute('playsinline', 'true');
+    video.style.position = 'fixed';
+    video.style.width = '2px';
+    video.style.height = '2px';
+    video.style.opacity = '0.001';
+    video.style.pointerEvents = 'none';
+    video.style.left = '-9999px';
+    video.style.top = '-9999px';
+    video.style.zIndex = '-1';
+    try {
+      document.body?.appendChild(video);
+    } catch {
+      // Ignore DOM append errors
+    }
     video.srcObject = new MediaStream(stream.getVideoTracks());
     video.play().catch(() => {});
     this.offscreenVideo = video;
 
-    const w = dataSaver ? 180 : 240;
-    const h = dataSaver ? 240 : 320;
+    const maxSide = dataSaver ? 240 : 320;
     const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
+    canvas.width = dataSaver ? 180 : 240;
+    canvas.height = dataSaver ? 240 : 320;
     this.canvas = canvas;
     const ctx = canvas.getContext('2d');
 
     this.videoTimer = window.setInterval(() => {
       if (this.stopped || isCameraOff() || !ctx || video.readyState < 2) return;
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      if (!vw || !vh) return;
+      const scale = Math.min(1, maxSide / Math.max(vw, vh));
+      const tw = Math.max(64, Math.round(vw * scale));
+      const th = Math.max(64, Math.round(vh * scale));
+      if (canvas.width !== tw || canvas.height !== th) {
+        canvas.width = tw;
+        canvas.height = th;
+      }
       try {
-        ctx.drawImage(video, 0, 0, w, h);
-        const jpg = canvas.toDataURL('image/jpeg', dataSaver ? 0.42 : 0.55);
-        if (jpg && jpg.length < 48000) {
+        ctx.drawImage(video, 0, 0, tw, th);
+        const jpg = canvas.toDataURL('image/jpeg', dataSaver ? 0.42 : 0.56);
+        if (jpg && jpg.length < 96000) {
           onSendVideo(jpg);
         }
       } catch {
         // Ignore transient canvas frame errors
       }
-    }, dataSaver ? 220 : 150);
+    }, dataSaver ? 200 : 125);
   }
 
   playIncomingAudio(pcmBase64: string, sampleRate = 24000) {
@@ -240,7 +274,12 @@ export class WssMediaRelay {
       this.videoTimer = null;
     }
     if (this.offscreenVideo) {
-      this.offscreenVideo.srcObject = null;
+      try {
+        this.offscreenVideo.srcObject = null;
+        this.offscreenVideo.remove();
+      } catch {
+        // Ignore DOM cleanup errors
+      }
       this.offscreenVideo = null;
     }
     this.canvas = null;

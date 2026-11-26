@@ -4,7 +4,7 @@ import jsQR from 'jsqr';
 import { Camera, Check, Copy, QrCode, Search, Upload, UserPlus, X } from 'lucide-react';
 import { translate, type TranslationKeys } from '../i18n/translations';
 import { apiFetch } from '../lib/api';
-import type { PublicUser, SelfUser } from '../types/app';
+import type { FriendRequestItem, PublicUser, SelfUser } from '../types/app';
 import { Avatar } from './Avatar';
 
 interface QrModalProps {
@@ -12,6 +12,8 @@ interface QrModalProps {
   initialTab?: 'my' | 'scan';
   selfUser: SelfUser;
   language: string;
+  incomingRequests?: FriendRequestItem[];
+  onRespondFriendRequest?: (requestId: string, action: 'accept' | 'reject') => Promise<void> | void;
   onClose: () => void;
   onRequestSent: () => void;
 }
@@ -21,6 +23,8 @@ export const QrModal: React.FC<QrModalProps> = ({
   initialTab = 'my',
   selfUser,
   language,
+  incomingRequests = [],
+  onRespondFriendRequest,
   onClose,
   onRequestSent,
 }) => {
@@ -351,6 +355,59 @@ export const QrModal: React.FC<QrModalProps> = ({
                   <span className="text-xs font-semibold text-slate-500 whitespace-nowrap">
                     {t('requestSent')}
                   </span>
+                ) : scannedUser.requestStatus === 'incoming_pending' ? (
+                  (() => {
+                    const pendingReq = incomingRequests.find((r) => r.user.id === scannedUser.id);
+                    if (pendingReq && onRespondFriendRequest) {
+                      return (
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            disabled={sendingReq}
+                            onClick={async () => {
+                              setSendingReq(true);
+                              try {
+                                await onRespondFriendRequest(pendingReq.requestId, 'accept');
+                                setScannedUser((prev) =>
+                                  prev ? { ...prev, isFriend: true, requestStatus: 'accepted' } : prev
+                                );
+                              } finally {
+                                setSendingReq(false);
+                              }
+                            }}
+                            className="inline-flex min-h-[40px] items-center gap-1 rounded-xl bg-teal-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-teal-800"
+                          >
+                            <Check className="h-3.5 w-3.5" />
+                            {t('acceptRequest')}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={sendingReq}
+                            onClick={async () => {
+                              setSendingReq(true);
+                              try {
+                                await onRespondFriendRequest(pendingReq.requestId, 'reject');
+                                setScannedUser((prev) =>
+                                  prev ? { ...prev, isFriend: false, requestStatus: 'none' } : prev
+                                );
+                              } finally {
+                                setSendingReq(false);
+                              }
+                            }}
+                            className="inline-flex min-h-[40px] items-center gap-1 rounded-xl border border-slate-300 dark:border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                            {t('rejectRequest')}
+                          </button>
+                        </div>
+                      );
+                    }
+                    return (
+                      <span className="text-xs font-semibold text-teal-700 dark:text-teal-400 whitespace-nowrap">
+                        {t('friendRequests')}
+                      </span>
+                    );
+                  })()
                 ) : (
                   <button
                     type="button"

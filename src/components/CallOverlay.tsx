@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Camera,
   CameraOff,
@@ -78,7 +78,12 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [webrtcVideoReady, setWebrtcVideoReady] = useState(false);
   const isNative = hasNativeAndroidBridge();
+
+  useEffect(() => {
+    setWebrtcVideoReady(false);
+  }, [session?.callId, remoteStream]);
 
   useEffect(() => {
     const syncRemotePlayback = () => {
@@ -88,6 +93,9 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
         }
         remoteVideoRef.current.muted = true;
         remoteVideoRef.current.play().catch(() => {});
+        if (remoteVideoRef.current.videoWidth > 0 && remoteVideoRef.current.videoHeight > 0) {
+          setWebrtcVideoReady(true);
+        }
       }
       if (remoteAudioRef.current && remoteStream) {
         if (remoteAudioRef.current.srcObject !== remoteStream) {
@@ -108,20 +116,24 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
     return () => {
       remoteStream.removeEventListener('addtrack', syncRemotePlayback);
     };
-  }, [remoteStream, speakerOn, session?.callId, isNative, relayActive]);
+  }, [remoteStream, speakerOn, session?.callId, isNative, relayActive, relayVideoFrame]);
 
   useEffect(() => {
-    if (localVideoRef.current && localStream) {
-      localVideoRef.current.srcObject = localStream;
+    if (localVideoRef.current && localStream && !cameraOff) {
+      if (localVideoRef.current.srcObject !== localStream) {
+        localVideoRef.current.srcObject = localStream;
+      }
       localVideoRef.current.play().catch(() => {});
     }
-  }, [localStream, session?.callId]);
+  }, [localStream, session?.callId, cameraOff]);
 
   if (!session) return null;
 
   const isVideo = session.callType === 'video';
   const hasWebRtcVideo = Boolean(remoteStream && remoteStream.getVideoTracks().length > 0);
-  const hasRemoteVideo = isVideo && (hasWebRtcVideo || Boolean(relayVideoFrame));
+  const showRelayVideo = isVideo && Boolean(relayVideoFrame) && (relayActive || !webrtcVideoReady);
+  const showWebRtcVideo = isVideo && hasWebRtcVideo && !showRelayVideo;
+  const hasRemoteVideo = showRelayVideo || (showWebRtcVideo && webrtcVideoReady);
   const statusLabel =
     session.phase === 'ringing'
       ? session.direction === 'incoming'
@@ -142,19 +154,34 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
         className="sr-only"
       />
 
-      {/* Remote Video Background (when video call is active) */}
-      {isVideo && hasWebRtcVideo ? (
+      {/* Remote Video Background (prefer WSS relay frames whenever relay is active or WebRTC has no decoded video yet) */}
+      {showRelayVideo && relayVideoFrame ? (
+        <img
+          src={relayVideoFrame}
+          alt={session.peer.displayName}
+          className="absolute inset-0 h-full w-full object-cover"
+        />
+      ) : showWebRtcVideo ? (
         <video
           ref={remoteVideoRef}
           autoPlay
           playsInline
           muted
-          className="absolute inset-0 h-full w-full object-cover"
-        />
-      ) : isVideo && relayVideoFrame ? (
-        <img
-          src={relayVideoFrame}
-          alt={session.peer.displayName}
+          onLoadedData={() => {
+            if (remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0) {
+              setWebrtcVideoReady(true);
+            }
+          }}
+          onPlaying={() => {
+            if (remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0) {
+              setWebrtcVideoReady(true);
+            }
+          }}
+          onResize={() => {
+            if (remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0) {
+              setWebrtcVideoReady(true);
+            }
+          }}
           className="absolute inset-0 h-full w-full object-cover"
         />
       ) : null}

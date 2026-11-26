@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
 import {
+  ArrowLeft,
   Check,
   Phone,
+  QrCode,
   Search,
   ShieldAlert,
   Upload,
@@ -21,6 +23,7 @@ interface ContactsPanelProps {
   outgoingRequests: FriendRequestItem[];
   onRefreshAll: () => void;
   onOpenQrScanner: () => void;
+  onBack?: () => void;
 }
 
 export const ContactsPanel: React.FC<ContactsPanelProps> = ({
@@ -29,6 +32,7 @@ export const ContactsPanel: React.FC<ContactsPanelProps> = ({
   outgoingRequests,
   onRefreshAll,
   onOpenQrScanner,
+  onBack,
 }) => {
   const t = (key: TranslationKeys) => translate(language, key);
 
@@ -185,32 +189,47 @@ export const ContactsPanel: React.FC<ContactsPanelProps> = ({
   };
 
   return (
-    <div className="space-y-6">
-      {/* Global Search + Discovery Toolbar */}
-      <div className="rounded-3xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 sm:p-6 space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="font-display text-xl font-bold text-slate-900 dark:text-white">
-            {t('contactsTitle')}
+    <div className="bg-white dark:bg-slate-900 min-h-[calc(100vh-116px)]">
+      {/* Header Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 dark:border-slate-800 px-4 py-3">
+        <div className="flex items-center gap-2">
+          {onBack && (
+            <button
+              type="button"
+              onClick={onBack}
+              aria-label="Back"
+              className="flex min-h-[40px] min-w-[40px] -ms-2 items-center justify-center rounded-full text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800"
+            >
+              <ArrowLeft className="h-5 w-5" />
+            </button>
+          )}
+          <h2 className="text-[17px] font-semibold text-slate-900 dark:text-white">
+            New Contacts
           </h2>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={onOpenQrScanner}
-              className="inline-flex min-h-[44px] items-center gap-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3.5 py-2 text-sm font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-700 whitespace-nowrap"
-            >
-              {t('scanQr')}
-            </button>
-            <button
-              type="button"
-              onClick={() => setSyncOpen((v) => !v)}
-              className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-teal-700 px-3.5 py-2 text-sm font-semibold text-white hover:bg-teal-800 whitespace-nowrap"
-            >
-              <Users className="h-4 w-4" />
-              {t('syncContacts')}
-            </button>
-          </div>
         </div>
 
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onOpenQrScanner}
+            className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3 text-xs font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-700 whitespace-nowrap"
+          >
+            <QrCode className="h-4 w-4 text-[#1D8BF1]" />
+            {t('scanQr')}
+          </button>
+          <button
+            type="button"
+            onClick={() => setSyncOpen((v) => !v)}
+            className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-[#1D8BF1] px-3 text-xs font-semibold text-white hover:bg-sky-600 whitespace-nowrap"
+          >
+            <Users className="h-4 w-4" />
+            {t('syncContacts')}
+          </button>
+        </div>
+      </div>
+
+      {/* Global Search + Discovery Toolbar */}
+      <div className="border-b-[8px] border-[#F3F4F6] dark:border-slate-950 p-4 space-y-4">
         <form onSubmit={runSearch} className="flex gap-2">
           <div className="relative flex-1">
             <Search className="pointer-events-none absolute start-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
@@ -219,7 +238,7 @@ export const ContactsPanel: React.FC<ContactsPanelProps> = ({
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder={t('searchPlaceholder')}
-              className="w-full min-h-[48px] rounded-2xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 ps-10 pe-4 text-sm sm:text-base text-slate-900 dark:text-white focus:border-teal-600 focus:outline-none"
+              className="w-full min-h-[48px] rounded-2xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 ps-10 pe-4 text-sm sm:text-base text-slate-900 dark:text-white focus:border-[#1D8BF1] focus:outline-none"
             />
           </div>
           <button

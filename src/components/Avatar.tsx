@@ -1,26 +1,29 @@
 import React, { useEffect, useState } from 'react';
+import { Check } from 'lucide-react';
 import { resolveApiUrl } from '../lib/api';
 
 interface AvatarProps {
   src: string | null | undefined;
   name: string;
-  size?: 'sm' | 'md' | 'lg' | 'xl';
+  size?: 'xs' | 'sm' | 'md' | 'lg' | 'xl';
   online?: boolean;
+  verifiedCheck?: boolean;
 }
 
 const SIZE_CLASSES: Record<NonNullable<AvatarProps['size']>, string> = {
+  xs: 'h-9 w-9 text-xs',
   sm: 'h-10 w-10 text-sm',
-  md: 'h-12 w-12 text-base',
+  md: 'h-[50px] w-[50px] text-base',
   lg: 'h-16 w-16 text-xl',
-  xl: 'h-24 w-24 text-2xl',
+  xl: 'h-20 w-20 text-2xl',
 };
 
 const PALETTES = [
-  'bg-teal-700 text-white',
-  'bg-sky-700 text-white',
-  'bg-emerald-700 text-white',
+  'bg-sky-600 text-white',
+  'bg-teal-600 text-white',
+  'bg-emerald-600 text-white',
+  'bg-indigo-600 text-white',
   'bg-slate-700 text-white',
-  'bg-cyan-800 text-white',
 ];
 
 function getInitials(name: string): string {
@@ -41,7 +44,13 @@ function getPaletteClass(name: string): string {
   return PALETTES[Math.abs(hash) % PALETTES.length];
 }
 
-export const Avatar: React.FC<AvatarProps> = ({ src, name, size = 'md', online }) => {
+export const Avatar: React.FC<AvatarProps> = ({
+  src,
+  name,
+  size = 'md',
+  online,
+  verifiedCheck,
+}) => {
   const [failed, setFailed] = useState(false);
   const sizeClass = SIZE_CLASSES[size];
   const resolvedSrc = src ? (src.startsWith('/api/') ? resolveApiUrl(src) : src) : null;
@@ -58,7 +67,7 @@ export const Avatar: React.FC<AvatarProps> = ({ src, name, size = 'md', online }
           alt={name || 'Profile photo'}
           referrerPolicy="no-referrer"
           onError={() => setFailed(true)}
-          className="h-full w-full rounded-full object-cover border border-slate-200 dark:border-slate-700"
+          className="h-full w-full rounded-full object-cover border border-slate-200/80 dark:border-slate-700"
         />
       ) : (
         <div
@@ -70,14 +79,24 @@ export const Avatar: React.FC<AvatarProps> = ({ src, name, size = 'md', online }
           {getInitials(name)}
         </div>
       )}
-      {online !== undefined && (
+      {verifiedCheck && online !== false ? (
         <span
-          title={online ? 'Online' : 'Offline'}
-          className={`absolute bottom-0 end-0 h-3.5 w-3.5 rounded-full border-2 border-white dark:border-slate-900 ${
-            online ? 'bg-emerald-500' : 'bg-slate-400 dark:bg-slate-600'
-          }`}
-        />
+          title={online ? 'Online' : 'Connected'}
+          className="absolute -bottom-0.5 -end-0.5 flex h-4 w-4 items-center justify-center rounded-full border-2 border-white dark:border-slate-900 bg-[#22C55E] text-white"
+        >
+          <Check className="h-2.5 w-2.5 stroke-[3]" />
+        </span>
+      ) : (
+        online !== undefined && (
+          <span
+            title={online ? 'Online' : 'Offline'}
+            className={`absolute bottom-0 end-0 h-3.5 w-3.5 rounded-full border-2 border-white dark:border-slate-900 ${
+              online ? 'bg-[#22C55E]' : 'bg-slate-400 dark:bg-slate-600'
+            }`}
+          />
+        )
       )}
     </div>
   );
 };
+

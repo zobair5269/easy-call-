@@ -706,12 +706,36 @@ export function createApiRouter(): Router {
       .filter((r) => !isBlockedBetween(user.id, r.id))
       .map((r) => {
         const friend = areFriends(user.id, r.id);
+        const pendingOut =
+          !friend &&
+          Boolean(
+            db
+              .prepare(
+                `SELECT 1 FROM friend_requests WHERE from_user_id = ? AND to_user_id = ? AND status = 'pending'`
+              )
+              .get(user.id, r.id)
+          );
+        const pendingIn =
+          !friend &&
+          Boolean(
+            db
+              .prepare(
+                `SELECT 1 FROM friend_requests WHERE from_user_id = ? AND to_user_id = ? AND status = 'pending'`
+              )
+              .get(r.id, user.id)
+          );
         return {
           ...getPublicUserView(r, true),
           online: r.show_online_status ? isUserOnline(r.id) : false,
           showOnlineStatus: Boolean(r.show_online_status),
           isFriend: friend,
-          requestStatus: friend ? 'accepted' : 'none',
+          requestStatus: friend
+            ? 'accepted'
+            : pendingOut
+              ? 'outgoing_pending'
+              : pendingIn
+                ? 'incoming_pending'
+                : 'none',
         };
       });
 
@@ -990,6 +1014,11 @@ export function createApiRouter(): Router {
         now,
         fr.id
       );
+      db.prepare(
+        `UPDATE notifications SET is_read = 1 WHERE user_id = ? AND related_user_id = ? AND type = 'friend_request'`
+      ).run(user.id, fr.from_user_id);
+      sendToUser(user.id, { type: 'notifications:refresh' });
+      sendToUser(fr.from_user_id, { type: 'friends:refresh' });
       res.json({ ok: true, status: 'rejected' });
       return;
     }
@@ -1007,6 +1036,9 @@ export function createApiRouter(): Router {
     db.prepare(
       `INSERT OR IGNORE INTO friendships (user_a, user_b, created_at) VALUES (?, ?, ?)`
     ).run(a, b, now);
+    db.prepare(
+      `UPDATE notifications SET is_read = 1 WHERE user_id = ? AND related_user_id = ? AND type = 'friend_request'`
+    ).run(user.id, fr.from_user_id);
 
     const accepterName = user.display_name || user.phone_e164;
     db.prepare(
@@ -1024,7 +1056,10 @@ export function createApiRouter(): Router {
       type: 'friend_request:accepted',
       friend: getPublicUserView(user, true),
     });
+    sendToUser(fr.from_user_id, { type: 'friends:refresh' });
     sendToUser(fr.from_user_id, { type: 'notifications:refresh' });
+    sendToUser(user.id, { type: 'friends:refresh' });
+    sendToUser(user.id, { type: 'notifications:refresh' });
 
     res.json({ ok: true, status: 'accepted' });
   });

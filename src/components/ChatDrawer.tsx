@@ -139,15 +139,15 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
               type="button"
               onClick={() => onStartCall(friend, 'audio')}
               aria-label={t('audioCall')}
-              className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl text-teal-700 dark:text-teal-400 hover:bg-teal-50 dark:hover:bg-teal-950/50"
+              className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full text-[#1D8BF1] hover:bg-sky-50 dark:hover:bg-sky-950/50"
             >
-              <Phone className="h-5 w-5" />
+              <Phone className="h-5 w-5 fill-[#1D8BF1]" />
             </button>
             <button
               type="button"
               onClick={() => onStartCall(friend, 'video')}
               aria-label={t('videoCall')}
-              className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl text-teal-700 dark:text-teal-400 hover:bg-teal-50 dark:hover:bg-teal-950/50"
+              className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full text-[#1D8BF1] hover:bg-sky-50 dark:hover:bg-sky-950/50"
             >
               <Video className="h-5 w-5" />
             </button>
@@ -155,7 +155,7 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
               type="button"
               onClick={onClose}
               aria-label={t('close')}
-              className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+              className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
             >
               <X className="h-5 w-5" />
             </button>
@@ -176,7 +176,7 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
                 <div
                   className={`max-w-[80%] rounded-2xl px-4 py-2.5 text-sm shadow-xs ${
                     mine
-                      ? 'bg-teal-700 text-white'
+                      ? 'bg-[#1D8BF1] text-white'
                       : 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 border border-slate-200 dark:border-slate-800'
                   }`}
                 >
@@ -191,7 +191,7 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
                   {m.body && <p className="whitespace-pre-wrap break-words">{m.body}</p>}
                   <div
                     className={`mt-1 flex items-center justify-end gap-1 text-[11px] ${
-                      mine ? 'text-teal-100' : 'text-slate-400'
+                      mine ? 'text-sky-100' : 'text-slate-400'
                     }`}
                   >
                     <span className="tabular-nums">
@@ -237,13 +237,13 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
             value={text}
             onChange={(e) => setText(e.target.value)}
             placeholder={t('typeMessage')}
-            className="flex-1 min-h-[44px] rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3.5 text-sm text-slate-900 dark:text-white focus:border-teal-600 focus:outline-none"
+            className="flex-1 min-h-[44px] rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3.5 text-sm text-slate-900 dark:text-white focus:border-[#1D8BF1] focus:outline-none"
           />
           <button
             type="submit"
             disabled={sending || !text.trim()}
             aria-label={t('send')}
-            className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl bg-teal-700 text-white hover:bg-teal-800 disabled:opacity-50 shrink-0"
+            className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl bg-[#1D8BF1] text-white hover:bg-sky-600 disabled:opacity-50 shrink-0"
           >
             <Send className="h-5 w-5" />
           </button>

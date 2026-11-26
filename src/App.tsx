@@ -1,10 +1,23 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Bell, Download, Home, Moon, PhoneCall, Settings, Sun } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Bell,
+  Contact,
+  MessageCircle,
+  PhoneCall,
+  Plus,
+  QrCode,
+  ScanLine,
+  Search,
+  UserPlus,
+  X,
+} from 'lucide-react';
 import { AdminBuilderPage } from './components/AdminBuilderPage';
 import { Avatar } from './components/Avatar';
 import { CallOverlay, type ActiveCallSession } from './components/CallOverlay';
 import { CallsTab } from './components/CallsTab';
 import { ChatDrawer } from './components/ChatDrawer';
+import { ContactsPanel } from './components/ContactsPanel';
+import { ContactsTabView } from './components/ContactsTabView';
 import { HomeTab } from './components/HomeTab';
 import { NotificationsDrawer } from './components/NotificationsDrawer';
 import { ProfileSettingsTab } from './components/ProfileSettingsTab';
@@ -29,6 +42,7 @@ import type {
   AppNotification,
   CallRecordItem,
   ChatMessage,
+  FriendRequestItem,
   HomeFeedItem,
   PublicUser,
   SelfUser,
@@ -79,9 +93,17 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   });
 
   const [activeTab, setActiveTab] = useState<ActiveTab>('home');
+  const [subPage, setSubPage] = useState<'calls' | 'newContacts' | null>(null);
+  const [meOpen, setMeOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [quickMenuOpen, setQuickMenuOpen] = useState(false);
+
   const [homeFeed, setHomeFeed] = useState<HomeFeedItem[]>([]);
+  const [friendsList, setFriendsList] = useState<PublicUser[]>([]);
   const [calls, setCalls] = useState<CallRecordItem[]>([]);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const [incomingRequests, setIncomingRequests] = useState<FriendRequestItem[]>([]);
+  const [outgoingRequests, setOutgoingRequests] = useState<FriendRequestItem[]>([]);
 
   const [qrOpen, setQrOpen] = useState(false);
   const [qrInitialTab, setQrInitialTab] = useState<'my' | 'scan'>('my');
@@ -231,18 +253,35 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const refreshAllData = useCallback(async () => {
     if (!user) return;
     try {
-      const [feedRes, callRes, notifRes] = await Promise.all([
+      const [feedRes, friendsRes, callRes, notifRes, reqRes] = await Promise.all([
         apiFetch<{ items: HomeFeedItem[] }>('/api/home-feed'),
+        apiFetch<{ friends: PublicUser[] }>('/api/friends'),
         apiFetch<{ calls: CallRecordItem[] }>('/api/calls'),
         apiFetch<{ notifications: AppNotification[] }>('/api/notifications'),
+        apiFetch<{ incoming: FriendRequestItem[]; outgoing?: FriendRequestItem[] }>('/api/friend-requests'),
       ]);
       setHomeFeed(feedRes.items || []);
+      setFriendsList(friendsRes.friends || []);
       setCalls(callRes.calls || []);
       setNotifications(notifRes.notifications || []);
+      setIncomingRequests(reqRes.incoming || []);
+      setOutgoingRequests(reqRes.outgoing || []);
     } catch {
       // Ignore transient refresh failure
     }
   }, [user]);
+
+  const respondFriendRequest = useCallback(
+    async (requestId: string, action: 'accept' | 'reject') => {
+      await apiFetch(`/api/friend-requests/${encodeURIComponent(requestId)}/respond`, {
+        method: 'POST',
+        body: JSON.stringify({ action }),
+      });
+      setIncomingRequests((prev) => prev.filter((r) => r.requestId !== requestId));
+      await refreshAllData();
+    },
+    [refreshAllData]
+  );
 
   useEffect(() => {
     mutedRef.current = muted;
@@ -575,22 +614,30 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           return;
         }
 
-        // Verify actual RTP packets are flowing over P2P (some CGNAT routers report connected then blackhole UDP)
+        // Verify actual RTP packets are flowing over P2P (some CGNAT routers report connected then blackhole UDP or drop video RTP)
         try {
-          let inboundBytes = 0;
+          let inboundAudioBytes = 0;
+          let inboundVideoBytes = 0;
           const stats = await pc.getStats();
           stats.forEach((report) => {
-            if (report.type === 'inbound-rtp' && report.kind === 'audio') {
-              inboundBytes += Number(report.bytesReceived || 0);
+            if (report.type === 'inbound-rtp') {
+              if (report.kind === 'audio') {
+                inboundAudioBytes += Number(report.bytesReceived || 0);
+              } else if (report.kind === 'video') {
+                inboundVideoBytes += Number(report.bytesReceived || 0);
+              }
             }
           });
-          if (inboundBytes === 0 && callSessionRef.current?.callId === callId) {
+          if (
+            callSessionRef.current?.callId === callId &&
+            (inboundAudioBytes === 0 || (callType === 'video' && inboundVideoBytes === 0))
+          ) {
             activateMediaRelay(callId, targetUserId, callType, true);
           }
         } catch {
           // Ignore stats errors
         }
-      }, 5000);
+      }, 4200);
     },
     [activateMediaRelay]
   );
@@ -606,6 +653,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       setRemoteStream(rStream);
 
       const hasLocalAudio = Boolean(localStreamRef.current && localStreamRef.current.getAudioTracks().length > 0);
+      const hasLocalVideo = Boolean(localStreamRef.current && localStreamRef.current.getVideoTracks().length > 0);
       if (localStreamRef.current) {
         for (const track of localStreamRef.current.getTracks()) {
           pc.addTrack(track, localStreamRef.current);
@@ -614,6 +662,13 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       if (!hasLocalAudio) {
         try {
           pc.addTransceiver('audio', { direction: 'recvonly' });
+        } catch {
+          // Ignore if transceiver add unsupported
+        }
+      }
+      if (callType === 'video' && !hasLocalVideo) {
+        try {
+          pc.addTransceiver('video', { direction: 'recvonly' });
         } catch {
           // Ignore if transceiver add unsupported
         }
@@ -1173,11 +1228,19 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     }
   };
 
-  const unreadNotifsCount = notifications.filter((n) => !n.isRead).length;
+  const unreadNotifsCount = Math.max(
+    notifications.filter((n) => !n.isRead).length,
+    incomingRequests.length
+  );
+
+  const totalUnreadChats = useMemo(
+    () => homeFeed.reduce((sum, item) => sum + (item.unreadCount || 0), 0),
+    [homeFeed]
+  );
 
   if (booting) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950">
+      <div className="min-h-screen flex items-center justify-center bg-white dark:bg-slate-950">
         <div className="flex flex-col items-center gap-4">
           <img
             src="/easycall-logo.png"
@@ -1209,116 +1272,99 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     );
   }
 
+  const chatBadgeCount = totalUnreadChats > 0 ? totalUnreadChats : unreadNotifsCount;
+
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-50 via-slate-50 to-teal-50/40 dark:from-slate-950 dark:via-slate-950 dark:to-teal-950/20 text-slate-900 dark:text-slate-100 pb-24 md:pb-10">
-      {/* Top Bar */}
-      <header className="sticky top-0 z-30 border-b border-slate-200/80 dark:border-slate-800/80 bg-white/90 dark:bg-slate-900/90 backdrop-blur-lg shadow-xs">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-2 sm:gap-6 px-3 py-2.5 sm:px-6">
-          <button
-            type="button"
-            onClick={() => setActiveTab('home')}
-            className="flex items-center gap-2.5 whitespace-nowrap min-w-0 text-start"
-          >
-            <div className="relative shrink-0">
-              <img
-                src="/easycall-logo.png"
-                alt="EASY CALL"
-                referrerPolicy="no-referrer"
-                className="h-9 w-9 rounded-full object-cover shadow-xs ring-1 ring-emerald-500/20"
+    <div className="min-h-screen bg-[#F3F4F6] dark:bg-slate-950 text-slate-900 dark:text-slate-100 pb-16">
+      {/* Screenshot 1 & 3 Top Header: Left Avatar + Chats Tab + Contacts Tab */}
+      <header className="sticky top-0 z-30 border-b border-slate-100 dark:border-slate-800 bg-white dark:bg-slate-900 pt-safe">
+        <div className="mx-auto flex h-14 max-w-3xl items-stretch px-3">
+          {/* Left Profile Avatar -> Opens "Me" Screen (Screenshot 2) */}
+          <div className="flex items-center pe-3 shrink-0">
+            <button
+              type="button"
+              onClick={() => setMeOpen(true)}
+              aria-label="Open Me & Settings"
+              className="relative flex items-center justify-center rounded-full focus-visible:outline-2 focus-visible:outline-[#1D8BF1]"
+            >
+              <Avatar
+                src={user.avatarUrl}
+                name={user.displayName || user.phoneE164}
+                size="xs"
               />
               <span
                 title={wsConnected ? 'Connected' : 'Connecting'}
                 className={`absolute -bottom-0.5 -end-0.5 h-2.5 w-2.5 rounded-full border-2 border-white dark:border-slate-900 ${
-                  wsConnected ? 'bg-emerald-500' : 'bg-amber-400'
+                  wsConnected ? 'bg-[#22C55E]' : 'bg-amber-400'
                 }`}
               />
-            </div>
-            <span className="font-display text-base sm:text-lg font-extrabold tracking-tight bg-gradient-to-r from-teal-700 to-emerald-600 dark:from-teal-300 dark:to-emerald-300 bg-clip-text text-transparent truncate">
-              {t('appName')}
-            </span>
-          </button>
+            </button>
+          </div>
 
-          {/* Desktop Nav Links (Clean imo-style 3 tabs: Home, Calls, Settings) */}
-          <nav className="hidden md:flex items-center gap-7 text-sm font-medium text-slate-600 dark:text-slate-300">
-            {(
-              [
-                ['home', t('navHome')],
-                ['calls', t('navCalls')],
-                ['settings', t('navSettings')],
-              ] as const
-            ).map(([key, label]) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => setActiveTab(key)}
-                className={`whitespace-nowrap shrink-0 py-1.5 border-b-2 transition-colors ${
-                  activeTab === key
-                    ? 'border-teal-700 dark:border-teal-400 text-slate-900 dark:text-white font-semibold'
-                    : 'border-transparent hover:text-slate-900 dark:hover:text-white'
-                }`}
-              >
-                {label}
-              </button>
-            ))}
-          </nav>
-
-          {/* Right Controls */}
-          <div className="flex items-center gap-1 sm:gap-2 shrink-0">
-            {isAdminEligible && (
-              <button
-                type="button"
-                onClick={onOpenAdmin}
-                className="inline-flex min-h-[38px] items-center gap-1 rounded-xl bg-gradient-to-r from-teal-700 to-emerald-700 px-2.5 sm:px-3 text-xs font-semibold text-white hover:from-teal-800 hover:to-emerald-800 shadow-xs"
-              >
-                <Download className="h-3.5 w-3.5 shrink-0" />
-                <span>APK</span>
-              </button>
-            )}
-
+          {/* 2 Equal Tabs: Chats & Contacts */}
+          <div className="grid flex-1 grid-cols-2">
             <button
               type="button"
-              onClick={() => setDarkMode((d) => !d)}
-              aria-label={darkMode ? t('lightMode') : t('darkMode')}
-              className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+              onClick={() => {
+                setSubPage(null);
+                setActiveTab('home');
+              }}
+              aria-label={t('navHome')}
+              className={`relative flex items-center justify-center min-h-[44px] border-b-[2.5px] transition-colors ${
+                activeTab === 'home' && !subPage
+                  ? 'border-[#1D8BF1] text-[#1D8BF1]'
+                  : 'border-transparent text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300'
+              }`}
             >
-              {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
+              <div className="relative flex items-center justify-center">
+                <MessageCircle
+                  className={`h-6 w-6 ${
+                    activeTab === 'home' && !subPage ? 'fill-[#1D8BF1]/20' : ''
+                  }`}
+                />
+                {chatBadgeCount > 0 && (
+                  <span className="absolute -top-2 -end-3 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-[#22C55E] px-1 text-[10px] font-bold text-white border-2 border-white dark:border-slate-900">
+                    {chatBadgeCount}
+                  </span>
+                )}
+              </div>
             </button>
 
             <button
               type="button"
-              onClick={() => setNotificationsOpen(true)}
-              aria-label={t('notifications')}
-              className="relative flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+              onClick={() => {
+                setSubPage(null);
+                setActiveTab('contacts');
+              }}
+              aria-label="Contacts"
+              className={`relative flex items-center justify-center min-h-[44px] border-b-[2.5px] transition-colors ${
+                activeTab === 'contacts' || subPage !== null
+                  ? 'border-[#1D8BF1] text-[#1D8BF1]'
+                  : 'border-transparent text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300'
+              }`}
             >
-              <Bell className="h-5 w-5" />
-              {unreadNotifsCount > 0 && (
-                <span className="absolute top-2 end-2 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-rose-600 px-1 text-[10px] font-bold text-white">
-                  {unreadNotifsCount}
-                </span>
-              )}
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setActiveTab('settings')}
-              aria-label={t('profileTitle')}
-              className="rounded-full focus-visible:outline-2 focus-visible:outline-teal-600"
-            >
-              <Avatar src={user.avatarUrl} name={user.displayName || user.phoneE164} size="sm" />
+              <div className="relative flex items-center justify-center">
+                <Contact className="h-6 w-6" />
+                {incomingRequests.length > 0 && (
+                  <span className="absolute -top-2 -end-3 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-[#22C55E] px-1 text-[10px] font-bold text-white border-2 border-white dark:border-slate-900">
+                    {incomingRequests.length}
+                  </span>
+                )}
+              </div>
             </button>
           </div>
         </div>
       </header>
 
       {!isOnline && !wsConnected && (
-        <div className="bg-amber-500 px-4 py-2 text-center text-xs font-semibold text-white">
+        <div className="bg-amber-500 px-4 py-1.5 text-center text-xs font-semibold text-white">
           No internet connection detected. Calls require an active internet or mobile data network.
         </div>
       )}
 
       {callNotice && (
-        <div className="mx-auto max-w-6xl px-4 pt-4 sm:px-6">
-          <div className="flex items-center justify-between gap-3 rounded-2xl border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/50 px-4 py-3 text-sm font-medium text-amber-900 dark:text-amber-200 shadow-xs">
+        <div className="mx-auto max-w-3xl px-3 pt-2">
+          <div className="flex items-center justify-between gap-3 rounded-xl border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/50 px-3.5 py-2.5 text-xs sm:text-sm font-medium text-amber-900 dark:text-amber-200 shadow-xs">
             <span>{callNotice}</span>
             <button
               type="button"
@@ -1331,23 +1377,13 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         </div>
       )}
 
-      {/* Main Content */}
-      <main className="mx-auto max-w-6xl px-4 py-6 sm:px-6">
-        {activeTab === 'home' && (
-          <HomeTab
-            language={language}
-            homeFeed={homeFeed}
-            recentCalls={calls}
-            onStartCall={startOutgoingCall}
-            onOpenChat={(f) => setActiveChatFriend(f)}
-            onRefreshAll={refreshAllData}
-          />
-        )}
-
-        {activeTab === 'calls' && (
+      {/* Main Content Container */}
+      <main className="mx-auto max-w-3xl shadow-xs">
+        {subPage === 'calls' ? (
           <CallsTab
             language={language}
             calls={calls}
+            onBack={() => setSubPage(null)}
             onClearHistory={async () => {
               await apiFetch('/api/calls', { method: 'DELETE' }).catch(() => {});
               setCalls([]);
@@ -1355,63 +1391,229 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             }}
             onCallback={startOutgoingCall}
           />
-        )}
-
-        {activeTab === 'settings' && (
-          <ProfileSettingsTab
+        ) : subPage === 'newContacts' ? (
+          <ContactsPanel
+            language={language}
+            incomingRequests={incomingRequests}
+            outgoingRequests={outgoingRequests}
+            onBack={() => setSubPage(null)}
+            onRefreshAll={refreshAllData}
+            onOpenQrScanner={() => {
+              setQrInitialTab('scan');
+              setQrOpen(true);
+            }}
+          />
+        ) : activeTab === 'contacts' ? (
+          <ContactsTabView
             selfUser={user}
             language={language}
-            darkMode={darkMode}
-            onToggleDarkMode={() => setDarkMode((d) => !d)}
-            onUserUpdated={(updated) => {
-              setUser(updated);
-              if (updated.language) setLanguage(updated.language);
+            friendsList={friendsList}
+            homeFeed={homeFeed}
+            incomingRequests={incomingRequests}
+            unreadNotificationsCount={unreadNotifsCount}
+            searchOpen={searchOpen}
+            onCloseSearch={() => setSearchOpen(false)}
+            onOpenNewContacts={() => setSubPage('newContacts')}
+            onOpenQrScanner={() => {
+              setQrInitialTab('scan');
+              setQrOpen(true);
             }}
             onOpenMyQr={() => {
               setQrInitialTab('my');
               setQrOpen(true);
             }}
-            onLoggedOut={() => {
-              cleanupCallMedia();
-              clearNativeSessionAuth();
-              setAuthToken(null);
-              setUser(null);
-              setHomeFeed([]);
-              setCalls([]);
+            onOpenCallHistory={() => setSubPage('calls')}
+            onOpenNotifications={() => setNotificationsOpen(true)}
+            onOpenChat={(f) => setActiveChatFriend(f)}
+            onStartCall={startOutgoingCall}
+            onRespondFriendRequest={respondFriendRequest}
+          />
+        ) : (
+          <HomeTab
+            selfUser={user}
+            language={language}
+            homeFeed={homeFeed}
+            recentCalls={calls}
+            friendsList={friendsList}
+            incomingRequests={incomingRequests}
+            searchOpen={searchOpen}
+            onCloseSearch={() => setSearchOpen(false)}
+            onRespondFriendRequest={respondFriendRequest}
+            onStartCall={startOutgoingCall}
+            onOpenChat={(f) => setActiveChatFriend(f)}
+            onOpenQrScanner={() => {
+              setQrInitialTab('scan');
+              setQrOpen(true);
             }}
+            onOpenMe={() => setMeOpen(true)}
           />
         )}
       </main>
 
-      {/* Mobile Fixed Bottom Thumb Navigation */}
-      <nav className="md:hidden fixed bottom-0 inset-x-0 z-30 border-t border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md pb-safe">
-        <div className="grid grid-cols-3 h-16 items-center">
-          {(
-            [
-              ['home', t('navHome'), Home],
-              ['calls', t('navCalls'), PhoneCall],
-              ['settings', t('navSettings'), Settings],
-            ] as const
-          ).map(([key, label, Icon]) => {
-            const active = activeTab === key;
-            return (
+      {/* Screenshot 1 & 3 Fixed Bottom Action Bar: + (left) and Search (right) */}
+      {!subPage && (
+        <footer className="fixed bottom-0 inset-x-0 z-30 border-t border-slate-100 dark:border-slate-800 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md pb-safe">
+          <div className="mx-auto flex h-14 max-w-3xl items-center justify-between px-3">
+            <button
+              type="button"
+              onClick={() => setQuickMenuOpen(true)}
+              aria-label="Quick actions"
+              className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full text-[#1D8BF1] hover:bg-sky-50 dark:hover:bg-sky-950/40"
+            >
+              <Plus className="h-7 w-7 stroke-[2]" />
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setSearchOpen((prev) => !prev)}
+              aria-label="Search"
+              className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full text-[#1D8BF1] hover:bg-sky-50 dark:hover:bg-sky-950/40"
+            >
+              <Search className="h-6 w-6 stroke-[2]" />
+            </button>
+          </div>
+        </footer>
+      )}
+
+      {/* Quick Actions Bottom Sheet (opened by Bottom-Left + Button) */}
+      {quickMenuOpen && (
+        <div
+          className="fixed inset-0 z-40 flex items-end justify-center bg-black/45 backdrop-blur-xs"
+          onClick={() => setQuickMenuOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-3xl rounded-t-3xl bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 p-4 pb-safe shadow-2xl space-y-1"
+          >
+            <div className="mx-auto mb-2 h-1.5 w-10 rounded-full bg-slate-300 dark:bg-slate-700" />
+            <div className="flex items-center justify-between px-2 pb-2">
+              <p className="text-sm font-semibold text-slate-900 dark:text-white">Quick Actions</p>
               <button
-                key={key}
                 type="button"
-                onClick={() => setActiveTab(key)}
-                className={`relative flex flex-col items-center justify-center min-h-[48px] ${
-                  active
-                    ? 'text-teal-700 dark:text-teal-400 font-semibold'
-                    : 'text-slate-500 dark:text-slate-400'
-                }`}
+                onClick={() => setQuickMenuOpen(false)}
+                className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
-                <Icon className="h-5 w-5" />
-                <span className="mt-1 text-[11px] leading-none truncate max-w-[72px]">{label}</span>
+                <X className="h-4 w-4" />
               </button>
-            );
-          })}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                setQuickMenuOpen(false);
+                setSubPage('newContacts');
+              }}
+              className="flex w-full min-h-[48px] items-center gap-3.5 rounded-xl px-3 hover:bg-slate-50 dark:hover:bg-slate-800 text-start"
+            >
+              <UserPlus className="h-5 w-5 text-[#1D8BF1]" />
+              <span className="text-sm font-medium text-slate-900 dark:text-white">
+                New Contacts & Friend Requests
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setQuickMenuOpen(false);
+                setQrInitialTab('scan');
+                setQrOpen(true);
+              }}
+              className="flex w-full min-h-[48px] items-center gap-3.5 rounded-xl px-3 hover:bg-slate-50 dark:hover:bg-slate-800 text-start"
+            >
+              <ScanLine className="h-5 w-5 text-emerald-500" />
+              <span className="text-sm font-medium text-slate-900 dark:text-white">
+                {t('scanQrCode')}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setQuickMenuOpen(false);
+                setQrInitialTab('my');
+                setQrOpen(true);
+              }}
+              className="flex w-full min-h-[48px] items-center gap-3.5 rounded-xl px-3 hover:bg-slate-50 dark:hover:bg-slate-800 text-start"
+            >
+              <QrCode className="h-5 w-5 text-amber-500" />
+              <span className="text-sm font-medium text-slate-900 dark:text-white">
+                {t('myQrCode')}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setQuickMenuOpen(false);
+                setSubPage('calls');
+              }}
+              className="flex w-full min-h-[48px] items-center gap-3.5 rounded-xl px-3 hover:bg-slate-50 dark:hover:bg-slate-800 text-start"
+            >
+              <PhoneCall className="h-5 w-5 text-[#1D8BF1]" />
+              <span className="text-sm font-medium text-slate-900 dark:text-white">
+                Call History
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setQuickMenuOpen(false);
+                setNotificationsOpen(true);
+              }}
+              className="flex w-full min-h-[48px] items-center justify-between rounded-xl px-3 hover:bg-slate-50 dark:hover:bg-slate-800 text-start"
+            >
+              <span className="flex items-center gap-3.5">
+                <Bell className="h-5 w-5 text-indigo-500" />
+                <span className="text-sm font-medium text-slate-900 dark:text-white">
+                  {t('notifications')}
+                </span>
+              </span>
+              {unreadNotifsCount > 0 && (
+                <span className="inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-rose-500 px-1.5 text-[11px] font-bold text-white">
+                  {unreadNotifsCount}
+                </span>
+              )}
+            </button>
+          </div>
         </div>
-      </nav>
+      )}
+
+      {/* Screenshot 2 "Me" Full-Screen Profile, Settings & QR Screen */}
+      <ProfileSettingsTab
+        open={meOpen}
+        selfUser={user}
+        language={language}
+        darkMode={darkMode}
+        isAdminEligible={isAdminEligible}
+        unreadNotificationsCount={unreadNotifsCount}
+        onClose={() => setMeOpen(false)}
+        onToggleDarkMode={() => setDarkMode((d) => !d)}
+        onUserUpdated={(updated) => {
+          setUser(updated);
+          if (updated.language) setLanguage(updated.language);
+        }}
+        onOpenMyQr={() => {
+          setQrInitialTab('my');
+          setQrOpen(true);
+        }}
+        onOpenScanQr={() => {
+          setQrInitialTab('scan');
+          setQrOpen(true);
+        }}
+        onOpenNotifications={() => setNotificationsOpen(true)}
+        onOpenAdmin={onOpenAdmin}
+        onLoggedOut={() => {
+          cleanupCallMedia();
+          clearNativeSessionAuth();
+          setAuthToken(null);
+          setMeOpen(false);
+          setUser(null);
+          setHomeFeed([]);
+          setFriendsList([]);
+          setCalls([]);
+        }}
+      />
 
       {/* Modals & Overlays */}
       <QrModal
@@ -1419,6 +1621,8 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         initialTab={qrInitialTab}
         selfUser={user}
         language={language}
+        incomingRequests={incomingRequests}
+        onRespondFriendRequest={respondFriendRequest}
         onClose={() => setQrOpen(false)}
         onRequestSent={refreshAllData}
       />
@@ -1427,11 +1631,13 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         open={notificationsOpen}
         language={language}
         notifications={notifications}
+        incomingRequests={incomingRequests}
         onClose={() => setNotificationsOpen(false)}
         onMarkAllRead={async () => {
           await apiFetch('/api/notifications/read-all', { method: 'POST' }).catch(() => {});
           setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
         }}
+        onRespondFriendRequest={respondFriendRequest}
       />
 
       <ChatDrawer
