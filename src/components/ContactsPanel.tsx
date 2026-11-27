@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { translate, type TranslationKeys } from '../i18n/translations';
 import { apiFetch } from '../lib/api';
+import { getNativeDeviceContacts, hasNativeAndroidBridge } from '../lib/nativeBridge';
 import type { FriendRequestItem, PublicUser } from '../types/app';
 import { Avatar } from './Avatar';
 
@@ -126,6 +127,9 @@ export const ContactsPanel: React.FC<ContactsPanelProps> = ({
       setMatchedContacts(res.matches);
       if (res.matches.length === 0) {
         setFeedback('No registered EASY CALL contacts matched those numbers.');
+      } else {
+        setFeedback(`${res.matches.length} registered EASY CALL contact(s) added to your Contacts list.`);
+        onRefreshAll();
       }
     } catch (err) {
       setFeedback(err instanceof Error ? err.message : 'Contact match failed.');
@@ -135,11 +139,18 @@ export const ContactsPanel: React.FC<ContactsPanelProps> = ({
   };
 
   const handleBrowserContactPicker = async () => {
+    if (hasNativeAndroidBridge()) {
+      const nativeNums = getNativeDeviceContacts();
+      if (nativeNums.length > 0) {
+        await matchNumbers(nativeNums);
+        return;
+      }
+    }
     const nav = navigator as unknown as {
       contacts?: { select: (props: string[], opts?: { multiple: boolean }) => Promise<Array<{ tel?: string[] }>> };
     };
     if (!nav.contacts || typeof nav.contacts.select !== 'function') {
-      setFeedback('Direct device contact picker is supported on mobile Android Chrome. Use .vcf import or paste numbers below.');
+      setFeedback('Direct device contact picker is supported on mobile Android Chrome & EASY CALL APK. Use .vcf import or paste numbers below.');
       return;
     }
     try {

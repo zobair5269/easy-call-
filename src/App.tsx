@@ -20,6 +20,7 @@ import { ContactsPanel } from './components/ContactsPanel';
 import { ContactsTabView } from './components/ContactsTabView';
 import { HomeTab } from './components/HomeTab';
 import { NotificationsDrawer } from './components/NotificationsDrawer';
+import { PhotoViewerModal, type PhotoViewerTarget } from './components/PhotoViewerModal';
 import { ProfileSettingsTab } from './components/ProfileSettingsTab';
 import { QrModal } from './components/QrModal';
 import { WelcomeAuth } from './components/WelcomeAuth';
@@ -28,6 +29,7 @@ import { apiFetch, buildWsUrl, getAuthToken, initApiConfig, resolveApiUrl, setAu
 import {
   clearNativeSessionAuth,
   consumeNativePendingAcceptCallId,
+  getNativeDeviceContacts,
   hasNativeAndroidBridge,
   setNativeCallAudioMode,
   setNativeRingtone,
@@ -109,10 +111,12 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const [qrInitialTab, setQrInitialTab] = useState<'my' | 'scan'>('my');
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [activeChatFriend, setActiveChatFriend] = useState<PublicUser | null>(null);
+  const [photoPreview, setPhotoPreview] = useState<PhotoViewerTarget | null>(null);
   const [liveMessages, setLiveMessages] = useState<ChatMessage[]>([]);
   const [isOnline, setIsOnline] = useState(() =>
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
+  const contactsSyncedUserIdRef = useRef<string | null>(null);
 
   // WebRTC & Signaling State
   const wsRef = useRef<WebSocket | null>(null);
@@ -304,6 +308,20 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       refreshAllData();
       syncNativeSessionAuth(resolveApiUrl(''), getAuthToken() || '', user.id);
       setNativeRingtone(getSelectedRingtoneId());
+      if (hasNativeAndroidBridge() && contactsSyncedUserIdRef.current !== user.id) {
+        const nums = getNativeDeviceContacts();
+        if (nums.length > 0) {
+          contactsSyncedUserIdRef.current = user.id;
+          apiFetch('/api/contacts/match', {
+            method: 'POST',
+            body: JSON.stringify({ numbers: nums }),
+          })
+            .then(() => refreshAllData())
+            .catch(() => {
+              contactsSyncedUserIdRef.current = null;
+            });
+        }
+      }
       const tok = getAuthToken();
       fetch(resolveApiUrl('/api/admin/status'), {
         headers: tok ? { 'X-User-Token': tok } : {},
@@ -317,6 +335,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         })
         .catch(() => {});
     } else {
+      contactsSyncedUserIdRef.current = null;
       setIsAdminEligible(false);
     }
   }, [user, refreshAllData]);
@@ -827,12 +846,27 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         } else if (msg.type === 'presence:update') {
           const uid = String(msg.userId);
           const online = Boolean(msg.online);
+          const lastSeenAt = Number(msg.lastSeenAt) || Date.now();
           setHomeFeed((prev) =>
             prev.map((item) =>
-              item.peer.id === uid ? { ...item, peer: { ...item.peer, online } } : item
+              item.peer.id === uid
+                ? { ...item, peer: { ...item.peer, online, lastSeenAt } }
+                : item
             )
           );
-        } else if (msg.type === 'friend_request:new' || msg.type === 'friend_request:accepted' || msg.type === 'friends:refresh' || msg.type === 'notifications:refresh') {
+          setFriendsList((prev) =>
+            prev.map((f) => (f.id === uid ? { ...f, online, lastSeenAt } : f))
+          );
+          setActiveChatFriend((prev) =>
+            prev && prev.id === uid ? { ...prev, online, lastSeenAt } : prev
+          );
+        } else if (
+          msg.type === 'friend_request:new' ||
+          msg.type === 'friend_request:accepted' ||
+          msg.type === 'friends:refresh' ||
+          msg.type === 'notifications:refresh' ||
+          msg.type === 'calls:refresh'
+        ) {
           refreshAllData();
         } else if (msg.type === 'chat:message' && msg.message) {
           const m = msg.message as ChatMessage;
@@ -840,10 +874,40 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           refreshAllData();
         } else if (msg.type === 'call:created') {
           const callId = String(msg.callId);
+          const deliveredNow = Boolean(msg.targetOnline);
           if (callSessionRef.current) {
-            callSessionRef.current = { ...callSessionRef.current, callId };
+            callSessionRef.current = {
+              ...callSessionRef.current,
+              callId,
+              phase:
+                callSessionRef.current.phase === 'calling' && deliveredNow
+                  ? 'ringing'
+                  : callSessionRef.current.phase,
+            };
           }
-          setCallSession((prev) => (prev ? { ...prev, callId } : prev));
+          setCallSession((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  callId,
+                  phase: prev.phase === 'calling' && deliveredNow ? 'ringing' : prev.phase,
+                }
+              : prev
+          );
+        } else if (msg.type === 'call:ringing') {
+          const callId = String(msg.callId);
+          if (
+            callSessionRef.current &&
+            callSessionRef.current.callId === callId &&
+            callSessionRef.current.phase === 'calling'
+          ) {
+            callSessionRef.current = { ...callSessionRef.current, phase: 'ringing' };
+          }
+          setCallSession((prev) =>
+            prev && prev.callId === callId && prev.phase === 'calling'
+              ? { ...prev, phase: 'ringing' }
+              : prev
+          );
         } else if (msg.type === 'call:unavailable') {
           cleanupCallMedia();
           refreshAllData();
@@ -1030,7 +1094,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       direction: 'outgoing',
       callType,
       peer,
-      phase: 'ringing',
+      phase: 'calling',
       startedAt: Date.now(),
     };
     callSessionRef.current = sessionDraft;
@@ -1238,6 +1302,34 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     [homeFeed]
   );
 
+  const totalMissedCalls = useMemo(
+    () => homeFeed.reduce((sum, item) => sum + (item.missedCount || 0), 0),
+    [homeFeed]
+  );
+
+  const openChatWithPeer = useCallback(
+    (peer: PublicUser) => {
+      setActiveChatFriend(peer);
+      apiFetch('/api/calls/mark-seen', {
+        method: 'POST',
+        body: JSON.stringify({ peerId: peer.id }),
+      })
+        .then(() => refreshAllData())
+        .catch(() => {});
+    },
+    [refreshAllData]
+  );
+
+  const openCallHistoryView = useCallback(() => {
+    setSubPage('calls');
+    apiFetch('/api/calls/mark-seen', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
+      .then(() => refreshAllData())
+      .catch(() => {});
+  }, [refreshAllData]);
+
   if (booting) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-white dark:bg-slate-950">
@@ -1272,7 +1364,8 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     );
   }
 
-  const chatBadgeCount = totalUnreadChats > 0 ? totalUnreadChats : unreadNotifsCount;
+  const chatBadgeCount =
+    totalUnreadChats + totalMissedCalls > 0 ? totalUnreadChats + totalMissedCalls : unreadNotifsCount;
 
   return (
     <div className="min-h-screen bg-[#F3F4F6] dark:bg-slate-950 text-slate-900 dark:text-slate-100 pb-16">
@@ -1384,6 +1477,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             language={language}
             calls={calls}
             onBack={() => setSubPage(null)}
+            onPreviewPhoto={setPhotoPreview}
             onClearHistory={async () => {
               await apiFetch('/api/calls', { method: 'DELETE' }).catch(() => {});
               setCalls([]);
@@ -1411,6 +1505,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             homeFeed={homeFeed}
             incomingRequests={incomingRequests}
             unreadNotificationsCount={unreadNotifsCount}
+            missedCallsCount={totalMissedCalls}
             searchOpen={searchOpen}
             onCloseSearch={() => setSearchOpen(false)}
             onOpenNewContacts={() => setSubPage('newContacts')}
@@ -1422,11 +1517,12 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
               setQrInitialTab('my');
               setQrOpen(true);
             }}
-            onOpenCallHistory={() => setSubPage('calls')}
+            onOpenCallHistory={openCallHistoryView}
             onOpenNotifications={() => setNotificationsOpen(true)}
-            onOpenChat={(f) => setActiveChatFriend(f)}
+            onOpenChat={openChatWithPeer}
             onStartCall={startOutgoingCall}
             onRespondFriendRequest={respondFriendRequest}
+            onPreviewPhoto={setPhotoPreview}
           />
         ) : (
           <HomeTab
@@ -1440,12 +1536,13 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             onCloseSearch={() => setSearchOpen(false)}
             onRespondFriendRequest={respondFriendRequest}
             onStartCall={startOutgoingCall}
-            onOpenChat={(f) => setActiveChatFriend(f)}
+            onOpenChat={openChatWithPeer}
             onOpenQrScanner={() => {
               setQrInitialTab('scan');
               setQrOpen(true);
             }}
             onOpenMe={() => setMeOpen(true)}
+            onPreviewPhoto={setPhotoPreview}
           />
         )}
       </main>
@@ -1545,7 +1642,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
               type="button"
               onClick={() => {
                 setQuickMenuOpen(false);
-                setSubPage('calls');
+                openCallHistoryView();
               }}
               className="flex w-full min-h-[48px] items-center gap-3.5 rounded-xl px-3 hover:bg-slate-50 dark:hover:bg-slate-800 text-start"
             >
@@ -1603,6 +1700,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         }}
         onOpenNotifications={() => setNotificationsOpen(true)}
         onOpenAdmin={onOpenAdmin}
+        onPreviewPhoto={setPhotoPreview}
         onLoggedOut={() => {
           cleanupCallMedia();
           clearNativeSessionAuth();
@@ -1653,7 +1751,10 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           setActiveChatFriend(null);
           startOutgoingCall(f, type);
         }}
+        onPreviewPhoto={setPhotoPreview}
       />
+
+      <PhotoViewerModal photo={photoPreview} onClose={() => setPhotoPreview(null)} />
 
       <CallOverlay
         language={language}

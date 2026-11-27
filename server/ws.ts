@@ -11,6 +11,13 @@ import { hashWithServerSecret } from './security.ts';
 const userSockets = new Map<string, Set<WebSocket>>();
 const backgroundStreams = new Map<string, Set<ServerResponse>>();
 const ringTimeouts = new Map<string, NodeJS.Timeout>();
+const deliveredCallIds = new Set<string>();
+
+export function notifyCallerRinging(callId: string, callerId: string): void {
+  if (deliveredCallIds.has(callId)) return;
+  deliveredCallIds.add(callId);
+  sendToUser(callerId, { type: 'call:ringing', callId });
+}
 
 interface CallSignalCache {
   callerId: string;
@@ -27,9 +34,11 @@ const activeCallSignals = new Map<string, CallSignalCache>();
 
 const BG_EVENT_TYPES = new Set([
   'call:incoming',
+  'call:ringing',
   'call:ended',
   'call:rejected',
   'call:accepted',
+  'calls:refresh',
   'chat:message',
   'friend_request:new',
   'friend_request:accepted',
@@ -281,8 +290,9 @@ export function acceptIncomingCallById(callId: string, userId: string): {
   }
 
   clearRingTimeout(callId);
+  deliveredCallIds.delete(callId);
   const now = Date.now();
-  db.prepare(`UPDATE call_records SET status = 'active', answered_at = ? WHERE id = ?`).run(
+  db.prepare(`UPDATE call_records SET status = 'active', answered_at = ?, callee_seen = 1 WHERE id = ?`).run(
     now,
     callId
   );
@@ -322,9 +332,10 @@ export function rejectIncomingCallById(callId: string, userId: string): boolean 
   if (!call || call.status !== 'ringing') return false;
 
   clearRingTimeout(callId);
+  deliveredCallIds.delete(callId);
   activeCallSignals.delete(callId);
   db.prepare(
-    `UPDATE call_records SET status = 'rejected', ended_at = ? WHERE id = ?`
+    `UPDATE call_records SET status = 'rejected', ended_at = ?, callee_seen = 0 WHERE id = ?`
   ).run(Date.now(), callId);
 
   sendToUser(call.caller_id, {
@@ -337,6 +348,8 @@ export function rejectIncomingCallById(callId: string, userId: string): boolean 
     callId,
     reason: 'rejected',
   });
+  sendToUser(call.caller_id, { type: 'calls:refresh' });
+  sendToUser(call.callee_id, { type: 'calls:refresh' });
   return true;
 }
 
@@ -373,6 +386,34 @@ export function initWebSocketServer(httpServer: HttpServer) {
       }
       ws.send(JSON.stringify({ type: 'ws:ready', userId }));
       replayCachedSignalsForUser(ws, userId);
+
+      // Deliver any active pending incoming call queued while this user was offline
+      const cutoff = Date.now() - 45_000;
+      const pendingIncoming = db
+        .prepare(
+          `SELECT id, caller_id, call_type FROM call_records
+           WHERE callee_id = ? AND status = 'ringing' AND started_at > ?
+           ORDER BY started_at DESC LIMIT 1`
+        )
+        .get(userId, cutoff) as
+        | { id: string; caller_id: string; call_type: 'audio' | 'video' }
+        | undefined;
+      if (pendingIncoming) {
+        const callerRow = db
+          .prepare('SELECT * FROM users WHERE id = ?')
+          .get(pendingIncoming.caller_id) as UserRow | undefined;
+        if (callerRow && !isBlockedBetween(userId, callerRow.id)) {
+          ws.send(
+            JSON.stringify({
+              type: 'call:incoming',
+              callId: pendingIncoming.id,
+              callType: pendingIncoming.call_type,
+              caller: getPublicUserView(callerRow, true),
+            })
+          );
+          notifyCallerRinging(pendingIncoming.id, pendingIncoming.caller_id);
+        }
+      }
     };
 
     if (authedUserId) {
@@ -406,7 +447,9 @@ export function initWebSocketServer(httpServer: HttpServer) {
       const userId = authedUserId;
 
       if (msg.type === 'ping') {
-        ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
+        const nowTs = Date.now();
+        db.prepare('UPDATE users SET last_seen_at = ? WHERE id = ?').run(nowTs, userId);
+        ws.send(JSON.stringify({ type: 'pong', ts: nowTs }));
         return;
       }
 
@@ -477,34 +520,17 @@ export function initWebSocketServer(httpServer: HttpServer) {
           })
         );
 
-        if (!targetOnline) {
-          db.prepare(
-            `UPDATE call_records SET status = 'missed', ended_at = ? WHERE id = ?`
-          ).run(Date.now(), callId);
-
-          const notifId = crypto.randomUUID();
-          const callerName = callerRow.display_name || callerRow.phone_e164;
-          db.prepare(
-            `INSERT INTO notifications (id, user_id, type, title, body, related_user_id, created_at)
-             VALUES (?, ?, 'missed_call', 'Missed call', ?, ?, ?)`
-          ).run(notifId, targetUserId, `${callerName} tried to call you (${callType}).`, userId, Date.now());
-
-          ws.send(
-            JSON.stringify({
-              type: 'call:unavailable',
-              callId,
-              reason: 'offline',
-            })
-          );
-          return;
+        if (targetOnline) {
+          const delivered = sendToUser(targetUserId, {
+            type: 'call:incoming',
+            callId,
+            callType,
+            caller: getPublicUserView(callerRow, true),
+          });
+          if (delivered) {
+            notifyCallerRinging(callId, userId);
+          }
         }
-
-        sendToUser(targetUserId, {
-          type: 'call:incoming',
-          callId,
-          callType,
-          caller: getPublicUserView(callerRow, true),
-        });
 
         const timeout = setTimeout(() => {
           const row = db
@@ -515,7 +541,7 @@ export function initWebSocketServer(httpServer: HttpServer) {
           if (row && row.status === 'ringing') {
             const endedAt = Date.now();
             db.prepare(
-              `UPDATE call_records SET status = 'missed', ended_at = ? WHERE id = ?`
+              `UPDATE call_records SET status = 'missed', ended_at = ?, callee_seen = 0 WHERE id = ?`
             ).run(endedAt, callId);
 
             const caller = db
@@ -540,8 +566,11 @@ export function initWebSocketServer(httpServer: HttpServer) {
               callId,
               reason: 'missed',
             });
+            sendToUser(row.caller_id, { type: 'calls:refresh' });
+            sendToUser(row.callee_id, { type: 'calls:refresh' });
             sendToUser(row.callee_id, { type: 'notifications:refresh' });
           }
+          deliveredCallIds.delete(callId);
           ringTimeouts.delete(callId);
         }, 45_000);
         ringTimeouts.set(callId, timeout);
@@ -585,16 +614,20 @@ export function initWebSocketServer(httpServer: HttpServer) {
         if (!call || ['completed', 'missed', 'rejected', 'cancelled'].includes(call.status)) return;
 
         clearRingTimeout(callId);
+        deliveredCallIds.delete(callId);
         activeCallSignals.delete(callId);
         const endedAt = Date.now();
         let nextStatus = 'completed';
         let durationSec = 0;
+        let calleeSeenVal = 1;
 
         if (call.answered_at) {
           durationSec = Math.max(1, Math.round((endedAt - call.answered_at) / 1000));
           nextStatus = 'completed';
+          calleeSeenVal = 1;
         } else {
           nextStatus = userId === call.caller_id ? 'cancelled' : 'missed';
+          calleeSeenVal = 0;
           if (nextStatus === 'cancelled') {
             const caller = db
               .prepare('SELECT display_name, phone_e164 FROM users WHERE id = ?')
@@ -615,8 +648,8 @@ export function initWebSocketServer(httpServer: HttpServer) {
         }
 
         db.prepare(
-          `UPDATE call_records SET status = ?, ended_at = ?, duration_sec = ? WHERE id = ?`
-        ).run(nextStatus, endedAt, durationSec, callId);
+          `UPDATE call_records SET status = ?, ended_at = ?, duration_sec = ?, callee_seen = ? WHERE id = ?`
+        ).run(nextStatus, endedAt, durationSec, calleeSeenVal, callId);
 
         const peerId = call.caller_id === userId ? call.callee_id : call.caller_id;
         sendToUser(peerId, {
@@ -625,6 +658,8 @@ export function initWebSocketServer(httpServer: HttpServer) {
           reason: 'hangup',
           durationSec,
         });
+        sendToUser(call.caller_id, { type: 'calls:refresh' });
+        sendToUser(call.callee_id, { type: 'calls:refresh' });
         return;
       }
 

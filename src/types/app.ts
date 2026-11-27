@@ -50,6 +50,7 @@ export interface CallRecordItem {
   startedAt: number;
   endedAt: number | null;
   durationSec: number;
+  calleeSeen?: boolean;
   canCallback: boolean;
 }
 
@@ -92,6 +93,7 @@ export interface HomeFeedItem {
     createdAt: number;
   } | null;
   unreadCount: number;
+  missedCount?: number;
 }
 
 export type ActiveTab = 'home' | 'calls' | 'contacts' | 'settings';

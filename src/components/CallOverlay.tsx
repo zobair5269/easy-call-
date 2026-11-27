@@ -21,7 +21,7 @@ export interface ActiveCallSession {
   direction: 'incoming' | 'outgoing';
   callType: 'audio' | 'video';
   peer: PublicUser;
-  phase: 'ringing' | 'connecting' | 'connected' | 'reconnecting';
+  phase: 'calling' | 'ringing' | 'connecting' | 'connected' | 'reconnecting';
   startedAt: number;
 }
 
@@ -135,15 +135,21 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   const showWebRtcVideo = isVideo && hasWebRtcVideo && !showRelayVideo;
   const hasRemoteVideo = showRelayVideo || (showWebRtcVideo && webrtcVideoReady);
   const statusLabel =
-    session.phase === 'ringing'
-      ? session.direction === 'incoming'
-        ? t('incomingCall')
-        : t('outgoingCall')
-      : session.phase === 'connecting'
-        ? t('connecting')
-        : session.phase === 'reconnecting'
-          ? t('reconnecting')
-          : formatDuration(durationSec);
+    session.phase === 'calling'
+      ? language === 'bn'
+        ? 'কল করা হচ্ছে...'
+        : 'Calling...'
+      : session.phase === 'ringing'
+        ? session.direction === 'incoming'
+          ? t('incomingCall')
+          : language === 'bn'
+            ? 'রিং হচ্ছে...'
+            : 'Ringing...'
+        : session.phase === 'connecting'
+          ? t('connecting')
+          : session.phase === 'reconnecting'
+            ? t('reconnecting')
+            : formatDuration(durationSec);
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col justify-between bg-slate-950 text-white">

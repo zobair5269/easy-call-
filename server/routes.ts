@@ -22,6 +22,7 @@ import {
   hashOtp,
   hashPin,
   hashWithServerSecret,
+  normalizeContactCandidates,
   normalizePhoneE164,
   resolveSafeUploadPath,
   verifyOtpHash,
@@ -31,6 +32,7 @@ import {
 import {
   acceptIncomingCallById,
   isUserOnline,
+  notifyCallerRinging,
   registerBackgroundStream,
   rejectIncomingCallById,
   sendToUser,
@@ -789,30 +791,39 @@ export function createApiRouter(): Router {
 
   router.post('/contacts/match', requireAuth, (req: AuthedRequest, res) => {
     const user = req.user!;
-    if (!checkRateLimit(`contacts-match:${user.id}`, 10, 10 * 60_000)) {
+    if (!checkRateLimit(`contacts-match:${user.id}`, 30, 10 * 60_000)) {
       res.status(429).json({ error: 'Contact sync rate limit exceeded.' });
       return;
     }
 
     const rawNumbers = Array.isArray(req.body?.numbers) ? req.body.numbers : [];
     const normalizedSet = new Set<string>();
-    for (const item of rawNumbers.slice(0, 200)) {
+    for (const item of rawNumbers.slice(0, 1500)) {
       if (typeof item === 'string') {
-        const e164 = normalizePhoneE164(item);
-        if (e164 && e164 !== user.phone_e164) {
-          normalizedSet.add(e164);
+        const candidates = normalizeContactCandidates(item, user.country_code || '+1');
+        for (const e164 of candidates) {
+          if (e164 !== user.phone_e164) {
+            normalizedSet.add(e164);
+          }
         }
       }
     }
 
     const matched: Array<Record<string, unknown>> = [];
+    const seenIds = new Set<string>();
     const stmt = db.prepare(
       `SELECT * FROM users WHERE phone_e164 = ? AND discoverable_by_phone = 1 LIMIT 1`
     );
+    const saveSyncedStmt = db.prepare(
+      `INSERT OR IGNORE INTO synced_contacts (owner_id, contact_user_id, created_at) VALUES (?, ?, ?)`
+    );
+    const now = Date.now();
 
     for (const phone of normalizedSet) {
       const target = stmt.get(phone) as UserRow | undefined;
-      if (target && !isBlockedBetween(user.id, target.id)) {
+      if (target && target.id !== user.id && !seenIds.has(target.id) && !isBlockedBetween(user.id, target.id)) {
+        seenIds.add(target.id);
+        saveSyncedStmt.run(user.id, target.id, now);
         const friend = areFriends(user.id, target.id);
         const pendingOut = Boolean(
           db
@@ -830,6 +841,9 @@ export function createApiRouter(): Router {
         );
         matched.push({
           ...getPublicUserView(target, true),
+          lastSeenAt: target.show_online_status ? target.last_seen_at : 0,
+          online: target.show_online_status ? isUserOnline(target.id) : false,
+          showOnlineStatus: Boolean(target.show_online_status),
           isFriend: friend,
           requestStatus: friend
             ? 'accepted'
@@ -849,17 +863,25 @@ export function createApiRouter(): Router {
     const user = req.user!;
     const rows = db
       .prepare(
-        `SELECT u.* FROM users u
-         INNER JOIN friendships f
-           ON (f.user_a = ? AND f.user_b = u.id) OR (f.user_b = ? AND f.user_a = u.id)
+        `SELECT DISTINCT u.* FROM users u
+         WHERE u.id != ? AND (
+           u.id IN (
+             SELECT CASE WHEN f.user_a = ? THEN f.user_b ELSE f.user_a END
+             FROM friendships f WHERE f.user_a = ? OR f.user_b = ?
+           )
+           OR u.id IN (
+             SELECT sc.contact_user_id FROM synced_contacts sc WHERE sc.owner_id = ?
+           )
+         )
          ORDER BY u.display_name ASC, u.phone_e164 ASC`
       )
-      .all(user.id, user.id) as unknown as UserRow[];
+      .all(user.id, user.id, user.id, user.id, user.id) as unknown as UserRow[];
 
     const friends = rows
       .filter((r) => !isBlockedBetween(user.id, r.id))
       .map((r) => ({
         ...getPublicUserView(r, true),
+        lastSeenAt: r.show_online_status ? r.last_seen_at : 0,
         online: r.show_online_status ? isUserOnline(r.id) : false,
         showOnlineStatus: Boolean(r.show_online_status),
       }));
@@ -1168,6 +1190,7 @@ export function createApiRouter(): Router {
       started_at: number;
       ended_at: number | null;
       duration_sec: number;
+      callee_seen: number;
       caller_name: string;
       caller_phone: string;
       caller_avatar: string | null;
@@ -1186,6 +1209,7 @@ export function createApiRouter(): Router {
         : r.caller_name || r.caller_phone;
       const peerAvatar = isOutgoing ? r.callee_avatar : r.caller_avatar;
       const peerCountry = isOutgoing ? r.callee_country : r.caller_country;
+      const mappedStatus = !isOutgoing && r.status === 'cancelled' ? 'missed' : r.status;
       return {
         id: r.id,
         peerId,
@@ -1194,15 +1218,33 @@ export function createApiRouter(): Router {
         peerCountryIso: peerCountry,
         direction: isOutgoing ? 'outgoing' : 'incoming',
         callType: r.call_type,
-        status: r.status,
+        status: mappedStatus,
         startedAt: r.started_at,
         endedAt: r.ended_at,
         durationSec: r.duration_sec,
+        calleeSeen: isOutgoing ? true : Boolean(r.callee_seen),
         canCallback: !isBlockedBetween(user.id, peerId),
       };
     });
 
     res.json({ calls });
+  });
+
+  router.post('/calls/mark-seen', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    const peerId = typeof req.body?.peerId === 'string' ? req.body.peerId : '';
+    if (peerId) {
+      db.prepare(
+        `UPDATE call_records SET callee_seen = 1
+         WHERE callee_id = ? AND caller_id = ? AND callee_seen = 0`
+      ).run(user.id, peerId);
+    } else {
+      db.prepare(
+        `UPDATE call_records SET callee_seen = 1
+         WHERE callee_id = ? AND callee_seen = 0`
+      ).run(user.id);
+    }
+    res.json({ ok: true });
   });
 
   router.get('/home-feed', requireAuth, (req: AuthedRequest, res) => {
@@ -1227,12 +1269,13 @@ export function createApiRouter(): Router {
           createdAt: number;
         };
         unreadCount: number;
+        missedCount: number;
       }
     >();
 
     const callRows = db
       .prepare(
-        `SELECT id, caller_id, callee_id, call_type, status, started_at, duration_sec
+        `SELECT id, caller_id, callee_id, call_type, status, started_at, duration_sec, callee_seen
          FROM call_records
          WHERE (caller_id = ? AND hidden_for_caller = 0)
             OR (callee_id = ? AND hidden_for_callee = 0)
@@ -1247,21 +1290,35 @@ export function createApiRouter(): Router {
       status: string;
       started_at: number;
       duration_sec: number;
+      callee_seen: number;
     }>;
 
     for (const c of callRows) {
-      const peerId = c.caller_id === user.id ? c.callee_id : c.caller_id;
+      const isOutgoing = c.caller_id === user.id;
+      const peerId = isOutgoing ? c.callee_id : c.caller_id;
       if (peerId === user.id) continue;
-      const existing = peerActivity.get(peerId) || { lastActivityAt: 0, unreadCount: 0 };
+      const existing = peerActivity.get(peerId) || {
+        lastActivityAt: 0,
+        unreadCount: 0,
+        missedCount: 0,
+      };
+      const mappedStatus = !isOutgoing && c.status === 'cancelled' ? 'missed' : c.status;
       if (!existing.lastCall) {
         existing.lastCall = {
           id: c.id,
-          direction: c.caller_id === user.id ? 'outgoing' : 'incoming',
+          direction: isOutgoing ? 'outgoing' : 'incoming',
           callType: c.call_type,
-          status: c.status,
+          status: mappedStatus,
           durationSec: c.duration_sec,
           startedAt: c.started_at,
         };
+      }
+      if (
+        !isOutgoing &&
+        !c.callee_seen &&
+        (c.status === 'missed' || c.status === 'rejected' || c.status === 'cancelled')
+      ) {
+        existing.missedCount += 1;
       }
       if (c.started_at > existing.lastActivityAt) {
         existing.lastActivityAt = c.started_at;
@@ -1290,7 +1347,11 @@ export function createApiRouter(): Router {
     for (const m of msgRows) {
       const peerId = m.sender_id === user.id ? m.receiver_id : m.sender_id;
       if (peerId === user.id) continue;
-      const existing = peerActivity.get(peerId) || { lastActivityAt: 0, unreadCount: 0 };
+      const existing = peerActivity.get(peerId) || {
+        lastActivityAt: 0,
+        unreadCount: 0,
+        missedCount: 0,
+      };
       if (!existing.lastMessage) {
         existing.lastMessage = {
           id: m.id,
@@ -1321,6 +1382,7 @@ export function createApiRouter(): Router {
       peerActivity.set(f.peer_id, {
         lastActivityAt: f.created_at,
         unreadCount: 0,
+        missedCount: 0,
       });
     }
 
@@ -1334,6 +1396,7 @@ export function createApiRouter(): Router {
       items.push({
         peer: {
           ...getPublicUserView(peerRow, true),
+          lastSeenAt: peerRow.show_online_status ? peerRow.last_seen_at : 0,
           online: peerRow.show_online_status ? isUserOnline(peerRow.id) : false,
           showOnlineStatus: Boolean(peerRow.show_online_status),
         },
@@ -1341,6 +1404,7 @@ export function createApiRouter(): Router {
         lastCall: info.lastCall || null,
         lastMessage: info.lastMessage || null,
         unreadCount: info.unreadCount,
+        missedCount: info.missedCount,
       });
     }
 
@@ -1351,7 +1415,7 @@ export function createApiRouter(): Router {
   router.delete('/calls', requireAuth, (req: AuthedRequest, res) => {
     const user = req.user!;
     db.prepare('UPDATE call_records SET hidden_for_caller = 1 WHERE caller_id = ?').run(user.id);
-    db.prepare('UPDATE call_records SET hidden_for_callee = 1 WHERE callee_id = ?').run(user.id);
+    db.prepare('UPDATE call_records SET hidden_for_callee = 1, callee_seen = 1 WHERE callee_id = ?').run(user.id);
     res.json({ ok: true });
   });
 
@@ -1531,6 +1595,7 @@ export function createApiRouter(): Router {
             caller: getPublicUserView(caller, true),
           })}\n\n`
         );
+        notifyCallerRinging(ringing.id, ringing.caller_id);
       }
     }
 
@@ -1572,6 +1637,7 @@ export function createApiRouter(): Router {
       return;
     }
 
+    notifyCallerRinging(ringing.id, ringing.caller_id);
     res.json({
       incoming: {
         callId: ringing.id,

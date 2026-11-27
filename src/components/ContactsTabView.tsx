@@ -18,6 +18,8 @@ import { translate, type TranslationKeys } from '../i18n/translations';
 import { apiFetch } from '../lib/api';
 import type { FriendRequestItem, HomeFeedItem, PublicUser, SelfUser } from '../types/app';
 import { Avatar } from './Avatar';
+import { formatLastSeen } from '../lib/formatLastSeen';
+import type { PhotoViewerTarget } from './PhotoViewerModal';
 
 interface ContactsTabViewProps {
   selfUser: SelfUser;
@@ -26,6 +28,7 @@ interface ContactsTabViewProps {
   homeFeed: HomeFeedItem[];
   incomingRequests: FriendRequestItem[];
   unreadNotificationsCount: number;
+  missedCallsCount?: number;
   searchOpen: boolean;
   onCloseSearch: () => void;
   onOpenNewContacts: () => void;
@@ -36,6 +39,7 @@ interface ContactsTabViewProps {
   onOpenChat: (peer: PublicUser) => void;
   onStartCall: (peer: PublicUser, callType: 'audio' | 'video') => void;
   onRespondFriendRequest: (requestId: string, action: 'accept' | 'reject') => Promise<void> | void;
+  onPreviewPhoto: (target: PhotoViewerTarget) => void;
 }
 
 const INDEX_LETTERS = ['#', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'];
@@ -52,6 +56,7 @@ export const ContactsTabView: React.FC<ContactsTabViewProps> = ({
   homeFeed,
   incomingRequests,
   unreadNotificationsCount,
+  missedCallsCount = 0,
   searchOpen,
   onCloseSearch,
   onOpenNewContacts,
@@ -62,6 +67,7 @@ export const ContactsTabView: React.FC<ContactsTabViewProps> = ({
   onOpenChat,
   onStartCall,
   onRespondFriendRequest,
+  onPreviewPhoto,
 }) => {
   const t = (key: TranslationKeys) => translate(language, key);
   const [sortMode, setSortMode] = useState<'name' | 'recent'>('name');
@@ -375,7 +381,14 @@ export const ContactsTabView: React.FC<ContactsTabViewProps> = ({
               Call History
             </span>
           </div>
-          <ChevronRight className="h-4 w-4 text-slate-400 shrink-0" />
+          <div className="flex items-center gap-2 shrink-0">
+            {missedCallsCount > 0 && (
+              <span className="inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-rose-500 px-1.5 text-[11px] font-bold text-white">
+                {missedCallsCount}
+              </span>
+            )}
+            <ChevronRight className="h-4 w-4 text-slate-400 shrink-0" />
+          </div>
         </button>
 
         <button
@@ -487,48 +500,69 @@ export const ContactsTabView: React.FC<ContactsTabViewProps> = ({
               </p>
             </div>
           ) : (
-            allContacts.map((person) => (
-              <div
-                key={person.id}
-                ref={(el) => {
-                  rowRefs.current[person.id] = el;
-                }}
-                className="flex items-center justify-between gap-2 px-4 py-3 hover:bg-slate-50/70 dark:hover:bg-slate-800/40"
-              >
-                <button
-                  type="button"
-                  onClick={() => onOpenChat(person)}
-                  className="flex flex-1 items-center gap-3.5 min-w-0 text-start"
+            allContacts.map((person) => {
+              const lastSeenLabel = formatLastSeen(person, language);
+              return (
+                <div
+                  key={person.id}
+                  ref={(el) => {
+                    rowRefs.current[person.id] = el;
+                  }}
+                  className="flex items-center justify-between gap-2 px-4 py-3 hover:bg-slate-50/70 dark:hover:bg-slate-800/40"
                 >
-                  <Avatar
-                    src={person.avatarUrl}
-                    name={person.displayName || person.phoneE164 || 'User'}
-                    size="md"
-                    verifiedCheck={person.showOnlineStatus && person.online}
-                  />
-                  <div className="min-w-0 flex-1">
-                    <p className="text-[15.5px] font-medium text-slate-900 dark:text-white truncate">
-                      {person.displayName || person.phoneE164}
-                    </p>
-                    {person.phoneE164 && (
-                      <p className="text-xs text-slate-400 dark:text-slate-500 truncate mt-0.5">
-                        {person.phoneE164}
-                      </p>
-                    )}
-                  </div>
-                </button>
+                  <div className="flex flex-1 items-center gap-3.5 min-w-0">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onPreviewPhoto({
+                          url: person.avatarUrl,
+                          name: person.displayName || person.phoneE164 || 'User',
+                          subtitle: lastSeenLabel || person.phoneE164,
+                        })
+                      }
+                      aria-label={`View ${person.displayName || 'User'} photo`}
+                      className="rounded-full shrink-0 focus-visible:outline-2 focus-visible:outline-[#1D8BF1]"
+                    >
+                      <Avatar
+                        src={person.avatarUrl}
+                        name={person.displayName || person.phoneE164 || 'User'}
+                        size="md"
+                        verifiedCheck={person.showOnlineStatus !== false && person.online === true}
+                      />
+                    </button>
 
-                <button
-                  type="button"
-                  onClick={() => onStartCall(person, 'audio')}
-                  aria-label={`${t('audioCall')} ${person.displayName}`}
-                  title={`${t('audioCall')} ${person.displayName}`}
-                  className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full text-[#1D8BF1] hover:bg-sky-50 dark:hover:bg-sky-950/40 shrink-0 active:scale-95 transition-transform"
-                >
-                  <Phone className="h-5 w-5 fill-[#1D8BF1]" />
-                </button>
-              </div>
-            ))
+                    <button
+                      type="button"
+                      onClick={() => onOpenChat(person)}
+                      className="min-w-0 flex-1 text-start"
+                    >
+                      <p className="text-[15.5px] font-medium text-slate-900 dark:text-white truncate">
+                        {person.displayName || person.phoneE164}
+                      </p>
+                      <p
+                        className={`text-xs truncate mt-0.5 ${
+                          person.online && person.showOnlineStatus !== false
+                            ? 'text-emerald-600 dark:text-emerald-400 font-medium'
+                            : 'text-slate-400 dark:text-slate-500'
+                        }`}
+                      >
+                        {lastSeenLabel || person.phoneE164 || person.countryIso}
+                      </p>
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => onStartCall(person, 'audio')}
+                    aria-label={`${t('audioCall')} ${person.displayName}`}
+                    title={`${t('audioCall')} ${person.displayName}`}
+                    className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full text-[#1D8BF1] hover:bg-sky-50 dark:hover:bg-sky-950/40 shrink-0 active:scale-95 transition-transform"
+                  >
+                    <Phone className="h-5 w-5 fill-[#1D8BF1]" />
+                  </button>
+                </div>
+              );
+            })
           )}
         </div>
 

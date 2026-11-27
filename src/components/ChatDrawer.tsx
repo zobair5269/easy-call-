@@ -4,6 +4,8 @@ import { translate, type TranslationKeys } from '../i18n/translations';
 import { apiFetch, fileToCompressedDataUrl, resolveApiUrl } from '../lib/api';
 import type { ChatMessage, PublicUser, SelfUser } from '../types/app';
 import { Avatar } from './Avatar';
+import { formatLastSeen } from '../lib/formatLastSeen';
+import type { PhotoViewerTarget } from './PhotoViewerModal';
 
 interface ChatDrawerProps {
   friend: PublicUser | null;
@@ -12,6 +14,7 @@ interface ChatDrawerProps {
   incomingMessages: ChatMessage[];
   onClose: () => void;
   onStartCall: (friend: PublicUser, type: 'audio' | 'video') => void;
+  onPreviewPhoto: (target: PhotoViewerTarget) => void;
 }
 
 export const ChatDrawer: React.FC<ChatDrawerProps> = ({
@@ -21,6 +24,7 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
   incomingMessages,
   onClose,
   onStartCall,
+  onPreviewPhoto,
 }) => {
   const t = (key: TranslationKeys) => translate(language, key);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -114,22 +118,37 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
         {/* Header */}
         <div className="flex items-center justify-between gap-3 border-b border-slate-200 dark:border-slate-800 px-4 py-3">
           <div className="flex items-center gap-3 min-w-0">
-            <Avatar
-              src={friend.avatarUrl}
-              name={friend.displayName}
-              size="md"
-              online={friend.showOnlineStatus ? friend.online : undefined}
-            />
+            <button
+              type="button"
+              onClick={() =>
+                onPreviewPhoto({
+                  url: friend.avatarUrl,
+                  name: friend.displayName,
+                  subtitle: formatLastSeen(friend, language),
+                })
+              }
+              aria-label={`View ${friend.displayName} photo`}
+              className="rounded-full shrink-0 focus-visible:outline-2 focus-visible:outline-[#1D8BF1]"
+            >
+              <Avatar
+                src={friend.avatarUrl}
+                name={friend.displayName}
+                size="md"
+                online={friend.showOnlineStatus !== false ? friend.online : undefined}
+              />
+            </button>
             <div className="min-w-0">
               <p className="font-display font-bold text-slate-900 dark:text-white truncate">
                 {friend.displayName}
               </p>
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                {friend.showOnlineStatus
-                  ? friend.online
-                    ? t('online')
-                    : t('offline')
-                  : friend.countryIso}
+              <p
+                className={`text-xs truncate ${
+                  friend.online && friend.showOnlineStatus !== false
+                    ? 'text-emerald-600 dark:text-emerald-400 font-medium'
+                    : 'text-slate-500 dark:text-slate-400'
+                }`}
+              >
+                {formatLastSeen(friend, language)}
               </p>
             </div>
           </div>

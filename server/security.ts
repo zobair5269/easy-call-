@@ -81,6 +81,39 @@ export function normalizePhoneE164(raw: string): string | null {
   return cleaned;
 }
 
+export function normalizeContactCandidates(raw: string, defaultCountryCode = '+1'): string[] {
+  const candidates = new Set<string>();
+  const cleaned = raw.trim().replace(/[\s\-().]/g, '');
+  if (!cleaned) return [];
+
+  if (cleaned.startsWith('+')) {
+    const direct = normalizePhoneE164(cleaned);
+    if (direct) candidates.add(direct);
+  } else if (cleaned.startsWith('00')) {
+    const intl = normalizePhoneE164('+' + cleaned.slice(2));
+    if (intl) candidates.add(intl);
+  } else if (/^\d{5,15}$/.test(cleaned)) {
+    const cc = defaultCountryCode.startsWith('+') ? defaultCountryCode : `+${defaultCountryCode}`;
+    const ccDigits = cc.slice(1);
+    const noLeadingZero = cleaned.replace(/^0+/, '');
+    if (cleaned.startsWith('0')) {
+      const localWithCc = normalizePhoneE164(`${cc}${noLeadingZero}`);
+      if (localWithCc) candidates.add(localWithCc);
+    } else {
+      const localWithCc = normalizePhoneE164(`${cc}${cleaned}`);
+      if (localWithCc) candidates.add(localWithCc);
+      if (cleaned.startsWith(ccDigits) && cleaned.length > ccDigits.length + 4) {
+        const directIntl = normalizePhoneE164(`+${cleaned}`);
+        if (directIntl) candidates.add(directIntl);
+      } else {
+        const plusDirect = normalizePhoneE164(`+${cleaned}`);
+        if (plusDirect) candidates.add(plusDirect);
+      }
+    }
+  }
+  return Array.from(candidates);
+}
+
 export function detectImageMimeFromMagicBytes(buf: Buffer): { mime: string; ext: string } | null {
   if (buf.length < 12) return null;
   // JPEG: FF D8 FF

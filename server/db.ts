@@ -107,8 +107,18 @@ db.exec(`
     duration_sec INTEGER NOT NULL DEFAULT 0,
     hidden_for_caller INTEGER NOT NULL DEFAULT 0,
     hidden_for_callee INTEGER NOT NULL DEFAULT 0,
+    callee_seen INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (caller_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (callee_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS synced_contacts (
+    owner_id TEXT NOT NULL,
+    contact_user_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, contact_user_id),
+    FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (contact_user_id) REFERENCES users(id) ON DELETE CASCADE
   );
 
   CREATE TABLE IF NOT EXISTS messages (
@@ -177,6 +187,16 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages(sender_id, receiver_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC);
 `);
+
+try {
+  const cols = db.prepare('PRAGMA table_info(call_records)').all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === 'callee_seen')) {
+    db.exec('ALTER TABLE call_records ADD COLUMN callee_seen INTEGER NOT NULL DEFAULT 0');
+    db.exec('UPDATE call_records SET callee_seen = 1');
+  }
+} catch {
+  // Ignore migration if already applied
+}
 
 export interface UserRow {
   id: string;

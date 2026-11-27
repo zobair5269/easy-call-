@@ -36,6 +36,7 @@ import {
 } from '../lib/ringtone';
 import type { PublicUser, SelfUser } from '../types/app';
 import { Avatar } from './Avatar';
+import type { PhotoViewerTarget } from './PhotoViewerModal';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface ProfileSettingsTabProps {
@@ -53,6 +54,7 @@ interface ProfileSettingsTabProps {
   onOpenNotifications: () => void;
   onOpenAdmin: () => void;
   onLoggedOut: () => void;
+  onPreviewPhoto: (target: PhotoViewerTarget) => void;
 }
 
 type MeSubView = 'menu' | 'edit' | 'security' | 'settings';
@@ -72,6 +74,7 @@ export const ProfileSettingsTab: React.FC<ProfileSettingsTabProps> = ({
   onOpenNotifications,
   onOpenAdmin,
   onLoggedOut,
+  onPreviewPhoto,
 }) => {
   const t = (key: TranslationKeys) => translate(language, key);
 
@@ -279,11 +282,24 @@ export const ProfileSettingsTab: React.FC<ProfileSettingsTabProps> = ({
               {/* Profile Header Identity Row */}
               <div className="relative flex items-center gap-4 px-4 pt-2 pb-5">
                 <div className="relative shrink-0">
-                  <Avatar
-                    src={selfUser.avatarUrl}
-                    name={selfUser.displayName || selfUser.phoneE164}
-                    size="lg"
-                  />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onPreviewPhoto({
+                        url: selfUser.avatarUrl,
+                        name: selfUser.displayName || selfUser.phoneE164,
+                        subtitle: selfUser.phoneE164,
+                      })
+                    }
+                    aria-label="View profile photo"
+                    className="rounded-full focus-visible:outline-2 focus-visible:outline-[#1D8BF1]"
+                  >
+                    <Avatar
+                      src={selfUser.avatarUrl}
+                      name={selfUser.displayName || selfUser.phoneE164}
+                      size="lg"
+                    />
+                  </button>
                   <label
                     title={t('uploadPhoto')}
                     className="absolute -bottom-0.5 -end-0.5 flex h-7 w-7 cursor-pointer items-center justify-center rounded-full bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 shadow-md border border-slate-200 dark:border-slate-700 hover:bg-slate-50"
@@ -526,11 +542,24 @@ export const ProfileSettingsTab: React.FC<ProfileSettingsTabProps> = ({
             {subView === 'edit' && (
               <div className="p-4 sm:p-6 space-y-5">
                 <div className="flex items-center gap-4">
-                  <Avatar
-                    src={selfUser.avatarUrl}
-                    name={selfUser.displayName || selfUser.phoneE164}
-                    size="xl"
-                  />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onPreviewPhoto({
+                        url: selfUser.avatarUrl,
+                        name: selfUser.displayName || selfUser.phoneE164,
+                        subtitle: selfUser.phoneE164,
+                      })
+                    }
+                    aria-label="View profile photo"
+                    className="rounded-full shrink-0"
+                  >
+                    <Avatar
+                      src={selfUser.avatarUrl}
+                      name={selfUser.displayName || selfUser.phoneE164}
+                      size="xl"
+                    />
+                  </button>
                   <div className="flex flex-wrap gap-2">
                     <label className="inline-flex min-h-[40px] cursor-pointer items-center gap-1.5 rounded-xl bg-[#1D8BF1] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-sky-600">
                       <Camera className="h-4 w-4" />

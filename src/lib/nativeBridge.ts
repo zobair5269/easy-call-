@@ -6,6 +6,7 @@ interface EasyCallNativeApi {
   setSpeakerphone?: (speakerOn: boolean) => void;
   setRingtone?: (ringtoneId: string) => void;
   consumePendingAcceptCallId?: () => string;
+  getDeviceContactsJson?: () => string;
 }
 
 declare global {
@@ -71,5 +72,16 @@ export function consumeNativePendingAcceptCallId(): string {
     return window.EasyCallNative?.consumePendingAcceptCallId?.() || '';
   } catch {
     return '';
+  }
+}
+
+export function getNativeDeviceContacts(): string[] {
+  try {
+    const raw = window.EasyCallNative?.getDeviceContactsJson?.();
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : [];
+  } catch {
+    return [];
   }
 }

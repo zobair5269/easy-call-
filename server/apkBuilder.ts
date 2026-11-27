@@ -337,6 +337,7 @@ export async function compileDirectAndroidApk(
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
@@ -1551,11 +1552,13 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.AssetManager;
+import android.database.Cursor;
 import android.graphics.Color;
 import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.ContactsContract;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
@@ -1945,6 +1948,48 @@ public class MainActivity extends Activity {
                 }
             });
         }
+
+        @JavascriptInterface
+        public String getDeviceContactsJson() {
+            Cursor cursor = null;
+            try {
+                if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+                    return "[]";
+                }
+                cursor = getContentResolver().query(
+                    ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                    new String[] { ContactsContract.CommonDataKinds.Phone.NUMBER },
+                    null,
+                    null,
+                    null
+                );
+                if (cursor == null) {
+                    return "[]";
+                }
+                java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+                org.json.JSONArray arr = new org.json.JSONArray();
+                int idx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER);
+                while (idx >= 0 && cursor.moveToNext() && seen.size() < 1200) {
+                    String num = cursor.getString(idx);
+                    if (num != null) {
+                        String trimmed = num.trim();
+                        if (!trimmed.isEmpty() && seen.add(trimmed)) {
+                            arr.put(trimmed);
+                        }
+                    }
+                }
+                return arr.toString();
+            } catch (Throwable ignored) {
+                return "[]";
+            } finally {
+                if (cursor != null) {
+                    try {
+                        cursor.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
     }
 
     private WebResourceResponse serveLocalAsset(String rawPath) {
@@ -2004,7 +2049,8 @@ public class MainActivity extends Activity {
             List<String> needed = new ArrayList<>();
             String[] perms = new String[] {
                 Manifest.permission.CAMERA,
-                Manifest.permission.RECORD_AUDIO
+                Manifest.permission.RECORD_AUDIO,
+                Manifest.permission.READ_CONTACTS
             };
             for (String p : perms) {
                 if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) {

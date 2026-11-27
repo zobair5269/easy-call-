@@ -11,6 +11,7 @@ import {
 import { translate, type TranslationKeys } from '../i18n/translations';
 import type { CallRecordItem, PublicUser } from '../types/app';
 import { Avatar } from './Avatar';
+import type { PhotoViewerTarget } from './PhotoViewerModal';
 
 interface CallsTabProps {
   language: string;
@@ -18,6 +19,7 @@ interface CallsTabProps {
   onClearHistory: () => void;
   onCallback: (peer: PublicUser, callType: 'audio' | 'video') => void;
   onBack?: () => void;
+  onPreviewPhoto?: (target: PhotoViewerTarget) => void;
 }
 
 function formatDuration(sec: number): string {
@@ -33,10 +35,16 @@ export const CallsTab: React.FC<CallsTabProps> = ({
   onClearHistory,
   onCallback,
   onBack,
+  onPreviewPhoto,
 }) => {
   const t = (key: TranslationKeys) => translate(language, key);
   const [filter, setFilter] = useState<'all' | 'incoming' | 'outgoing' | 'missed'>('all');
   const [confirmClear, setConfirmClear] = useState(false);
+
+  const missedTotal = useMemo(
+    () => calls.filter((c) => c.status === 'missed' || c.status === 'rejected').length,
+    [calls]
+  );
 
   const filtered = useMemo(() => {
     if (filter === 'all') return calls;
@@ -109,7 +117,7 @@ export const CallsTab: React.FC<CallsTabProps> = ({
               ['all', t('callAll')],
               ['incoming', t('callIncoming')],
               ['outgoing', t('callOutgoing')],
-              ['missed', t('callMissed')],
+              ['missed', missedTotal > 0 ? `${t('callMissed')} (${missedTotal})` : t('callMissed')],
             ] as const
           ).map(([key, label]) => (
             <button
@@ -150,7 +158,18 @@ export const CallsTab: React.FC<CallsTabProps> = ({
             return (
               <div key={c.id} className="flex items-center justify-between gap-3 px-4 py-3">
                 <div className="flex items-center gap-3.5 min-w-0">
-                  <Avatar src={c.peerAvatarUrl} name={c.peerName} size="md" />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onPreviewPhoto?.({
+                        url: c.peerAvatarUrl,
+                        name: c.peerName,
+                      })
+                    }
+                    className="rounded-full shrink-0"
+                  >
+                    <Avatar src={c.peerAvatarUrl} name={c.peerName} size="md" />
+                  </button>
                   <div className="min-w-0">
                     <p
                       className={`text-[15.5px] font-semibold truncate ${

@@ -23,6 +23,8 @@ import type {
   SelfUser,
 } from '../types/app';
 import { Avatar } from './Avatar';
+import { formatLastSeen } from '../lib/formatLastSeen';
+import type { PhotoViewerTarget } from './PhotoViewerModal';
 
 interface HomeTabProps {
   selfUser: SelfUser;
@@ -38,6 +40,7 @@ interface HomeTabProps {
   onOpenChat: (peer: PublicUser) => void;
   onOpenQrScanner: () => void;
   onOpenMe: () => void;
+  onPreviewPhoto: (target: PhotoViewerTarget) => void;
 }
 
 function formatImoTimestamp(ts: number): string {
@@ -76,6 +79,7 @@ export const HomeTab: React.FC<HomeTabProps> = ({
   onOpenChat,
   onOpenQrScanner,
   onOpenMe,
+  onPreviewPhoto,
 }) => {
   const t = (key: TranslationKeys) => translate(language, key);
   const [query, setQuery] = useState('');
@@ -411,23 +415,29 @@ export const HomeTab: React.FC<HomeTabProps> = ({
             <div className="divide-y divide-slate-100/90 dark:divide-slate-800/70">
               {homeFeed.map((item) => {
                 const { peer, lastCall, lastMessage, lastActivityAt, unreadCount } = item;
+                const missedCount = item.missedCount || 0;
                 const callNewer =
                   lastCall && (!lastMessage || lastCall.startedAt >= lastMessage.createdAt);
 
                 let subtitleNode: React.ReactNode = (
                   <span className="truncate text-slate-500 dark:text-slate-400">
-                    {peer.phoneE164 || peer.countryIso}
+                    {formatLastSeen(peer, language) || peer.phoneE164 || peer.countryIso}
                   </span>
                 );
 
-                if (callNewer && lastCall) {
-                  const isCanceled = lastCall.status === 'cancelled';
-                  const isMissed = lastCall.status === 'missed' || lastCall.status === 'rejected';
+                if ((callNewer && lastCall) || (missedCount > 0 && !lastMessage)) {
+                  const isCanceled = lastCall?.status === 'cancelled';
+                  const isMissed =
+                    missedCount > 0 ||
+                    lastCall?.status === 'missed' ||
+                    lastCall?.status === 'rejected';
                   const label = isCanceled
                     ? 'Canceled'
                     : isMissed
-                    ? 'Missed'
-                    : lastCall.callType === 'video'
+                    ? missedCount > 1
+                      ? `Missed call (${missedCount})`
+                      : 'Missed call'
+                    : lastCall?.callType === 'video'
                     ? 'Video Call'
                     : 'Audio Call';
 
@@ -435,12 +445,12 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                     <span className="inline-flex items-center gap-1.5 text-slate-500 dark:text-slate-400 truncate">
                       {isMissed ? (
                         <PhoneMissed className="h-3.5 w-3.5 text-rose-500 shrink-0" />
-                      ) : lastCall.direction === 'incoming' ? (
+                      ) : lastCall?.direction === 'incoming' ? (
                         <PhoneIncoming className="h-3.5 w-3.5 text-slate-400 shrink-0" />
                       ) : (
                         <PhoneOutgoing className="h-3.5 w-3.5 text-slate-400 shrink-0" />
                       )}
-                      <span className={isMissed ? 'text-rose-500 dark:text-rose-400' : ''}>
+                      <span className={isMissed ? 'text-rose-500 dark:text-rose-400 font-medium' : ''}>
                         {label}
                       </span>
                     </span>
@@ -458,19 +468,32 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                     key={peer.id}
                     className="flex items-center justify-between gap-2 px-4 py-3 hover:bg-slate-50/70 dark:hover:bg-slate-800/40 transition-colors"
                   >
-                    <button
-                      type="button"
-                      onClick={() => onOpenChat(peer)}
-                      className="flex flex-1 items-center gap-3.5 min-w-0 text-start"
-                    >
-                      <Avatar
-                        src={peer.avatarUrl}
-                        name={peer.displayName || peer.phoneE164 || 'User'}
-                        size="md"
-                        verifiedCheck={peer.showOnlineStatus !== false && peer.online !== false}
-                      />
+                    <div className="flex flex-1 items-center gap-3.5 min-w-0">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onPreviewPhoto({
+                            url: peer.avatarUrl,
+                            name: peer.displayName || peer.phoneE164 || 'User',
+                            subtitle: formatLastSeen(peer, language),
+                          })
+                        }
+                        aria-label={`View ${peer.displayName || 'User'} photo`}
+                        className="rounded-full shrink-0 focus-visible:outline-2 focus-visible:outline-[#1D8BF1]"
+                      >
+                        <Avatar
+                          src={peer.avatarUrl}
+                          name={peer.displayName || peer.phoneE164 || 'User'}
+                          size="md"
+                          verifiedCheck={peer.showOnlineStatus !== false && peer.online === true}
+                        />
+                      </button>
 
-                      <div className="min-w-0 flex-1">
+                      <button
+                        type="button"
+                        onClick={() => onOpenChat(peer)}
+                        className="min-w-0 flex-1 text-start"
+                      >
                         <div className="flex items-center justify-between gap-2">
                           <p className="text-[15.5px] font-semibold text-slate-900 dark:text-white truncate">
                             {peer.displayName || peer.phoneE164}
@@ -481,14 +504,24 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                         </div>
                         <div className="mt-0.5 flex items-center justify-between gap-2 text-[13.5px] min-w-0">
                           <div className="truncate min-w-0">{subtitleNode}</div>
-                          {unreadCount > 0 && (
-                            <span className="inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-[#22C55E] px-1.5 text-[11px] font-bold text-white shrink-0">
-                              {unreadCount}
-                            </span>
-                          )}
+                          <div className="flex items-center gap-1 shrink-0">
+                            {missedCount > 0 && (
+                              <span
+                                title={`${missedCount} missed call(s)`}
+                                className="inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-rose-500 px-1.5 text-[11px] font-bold text-white"
+                              >
+                                {missedCount}
+                              </span>
+                            )}
+                            {unreadCount > 0 && (
+                              <span className="inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-[#22C55E] px-1.5 text-[11px] font-bold text-white">
+                                {unreadCount}
+                              </span>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    </button>
+                      </button>
+                    </div>
 
                     <button
                       type="button"
