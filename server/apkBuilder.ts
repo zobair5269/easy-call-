@@ -1922,6 +1922,41 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void saveHistorySnapshot(final String phoneKey, final String json) {
+            try {
+                if (phoneKey == null || phoneKey.trim().isEmpty() || json == null) return;
+                String safeKey = "hist_" + phoneKey.trim().replaceAll("[^0-9+]", "");
+                SharedPreferences prefs = getSharedPreferences("easycall_history_store", MODE_PRIVATE);
+                prefs.edit().putString(safeKey, json).apply();
+            } catch (Throwable ignored) {
+            }
+        }
+
+        @JavascriptInterface
+        public String getHistorySnapshot(final String phoneKey) {
+            try {
+                if (phoneKey == null || phoneKey.trim().isEmpty()) return "";
+                String safeKey = "hist_" + phoneKey.trim().replaceAll("[^0-9+]", "");
+                SharedPreferences prefs = getSharedPreferences("easycall_history_store", MODE_PRIVATE);
+                String val = prefs.getString(safeKey, "");
+                return val != null ? val : "";
+            } catch (Throwable ignored) {
+                return "";
+            }
+        }
+
+        @JavascriptInterface
+        public void clearHistorySnapshot(final String phoneKey) {
+            try {
+                if (phoneKey == null || phoneKey.trim().isEmpty()) return;
+                String safeKey = "hist_" + phoneKey.trim().replaceAll("[^0-9+]", "");
+                SharedPreferences prefs = getSharedPreferences("easycall_history_store", MODE_PRIVATE);
+                prefs.edit().remove(safeKey).apply();
+            } catch (Throwable ignored) {
+            }
+        }
+
+        @JavascriptInterface
         public void stopRinging() {
             EasyCallService.stopRingingStatic(MainActivity.this);
         }

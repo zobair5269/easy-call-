@@ -37,6 +37,18 @@ import {
   stopNativeRinging,
   syncNativeSessionAuth,
 } from './lib/nativeBridge';
+import {
+  buildHistoryRestorePayload,
+  clearLocalHistory,
+  loadLocalHistory,
+  mergeCalls,
+  mergeFriends,
+  mergeHomeFeed,
+  mergeThreadMessages,
+  migrateSelfUserId,
+  saveLocalHistory,
+  type StoredThread,
+} from './lib/localHistory';
 import { getSelectedRingtoneId, ringtone } from './lib/ringtone';
 import { WssMediaRelay } from './lib/wssMediaRelay';
 import type {
@@ -118,6 +130,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
   const contactsSyncedUserIdRef = useRef<string | null>(null);
+  const historyRestoredPhoneRef = useRef<string | null>(null);
 
   // WebRTC & Signaling State
   const wsRef = useRef<WebSocket | null>(null);
@@ -296,21 +309,53 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const refreshAllData = useCallback(async () => {
     if (!user) return;
     try {
-      const [feedRes, friendsRes, callRes, notifRes, reqRes] = await Promise.all([
+      const [feedRes, friendsRes, callRes, notifRes, reqRes, snapRes] = await Promise.all([
         apiFetch<{ items: HomeFeedItem[] }>('/api/home-feed'),
         apiFetch<{ friends: PublicUser[] }>('/api/friends'),
         apiFetch<{ calls: CallRecordItem[] }>('/api/calls'),
         apiFetch<{ notifications: AppNotification[] }>('/api/notifications'),
         apiFetch<{ incoming: FriendRequestItem[]; outgoing?: FriendRequestItem[] }>('/api/friend-requests'),
+        apiFetch<{ threads: Record<string, StoredThread> }>('/api/history/snapshot').catch(() => ({
+          threads: {} as Record<string, StoredThread>,
+        })),
       ]);
-      setHomeFeed(feedRes.items || []);
-      setFriendsList(friendsRes.friends || []);
-      setCalls(callRes.calls || []);
+
+      const localSnap = loadLocalHistory(user.phoneE164);
+      const mergedFeed = mergeHomeFeed(feedRes.items || [], localSnap.homeFeed);
+      const mergedFriends = mergeFriends(friendsRes.friends || [], localSnap.friendsList);
+      const mergedCalls = mergeCalls(callRes.calls || [], localSnap.calls);
+
+      const mergedThreads: Record<string, StoredThread> = { ...localSnap.threads };
+      if (snapRes?.threads && typeof snapRes.threads === 'object') {
+        for (const [peerKey, srvThread] of Object.entries(snapRes.threads)) {
+          if (!srvThread || !Array.isArray(srvThread.messages)) continue;
+          const prevThread = mergedThreads[peerKey] || mergedThreads[srvThread.peerId];
+          mergedThreads[peerKey] = {
+            peerId: srvThread.peerId,
+            peerPhone: srvThread.peerPhone || peerKey,
+            messages: mergeThreadMessages(srvThread.messages, prevThread?.messages || []),
+          };
+        }
+      }
+
+      setHomeFeed(mergedFeed);
+      setFriendsList(mergedFriends);
+      setCalls(mergedCalls);
       setNotifications(notifRes.notifications || []);
       setIncomingRequests(reqRes.incoming || []);
       setOutgoingRequests(reqRes.outgoing || []);
+
+      saveLocalHistory({
+        selfUserId: user.id,
+        phoneE164: user.phoneE164,
+        homeFeed: mergedFeed,
+        friendsList: mergedFriends,
+        calls: mergedCalls,
+        threads: mergedThreads,
+        updatedAt: Date.now(),
+      });
     } catch {
-      // Ignore transient refresh failure
+      // Ignore transient refresh failure; keep any loaded local history intact
     }
   }, [user]);
 
@@ -344,7 +389,38 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
   useEffect(() => {
     if (user) {
-      refreshAllData();
+      const localSnap = migrateSelfUserId(loadLocalHistory(user.phoneE164), user.id);
+      if (localSnap.homeFeed.length > 0) setHomeFeed(localSnap.homeFeed);
+      if (localSnap.friendsList.length > 0) setFriendsList(localSnap.friendsList);
+      if (localSnap.calls.length > 0) setCalls(localSnap.calls);
+
+      const syncAndRestore = async () => {
+        if (historyRestoredPhoneRef.current !== user.phoneE164) {
+          historyRestoredPhoneRef.current = user.phoneE164;
+          const hasLocalData =
+            localSnap.calls.length > 0 ||
+            Object.keys(localSnap.threads).length > 0 ||
+            localSnap.friendsList.length > 0 ||
+            localSnap.homeFeed.length > 0;
+          if (hasLocalData) {
+            const payload = buildHistoryRestorePayload(localSnap, user.id);
+            if (
+              payload.calls.length > 0 ||
+              payload.messages.length > 0 ||
+              payload.peers.length > 0
+            ) {
+              await apiFetch('/api/history/restore', {
+                method: 'POST',
+                body: JSON.stringify(payload),
+              }).catch(() => {});
+            }
+          }
+        }
+        await refreshAllData();
+      };
+
+      void syncAndRestore();
+
       const activeTok = getAuthToken();
       if (activeTok) {
         syncNativeSessionAuth(resolveApiUrl(''), activeTok, user.id);
@@ -378,6 +454,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         .catch(() => {});
     } else {
       contactsSyncedUserIdRef.current = null;
+      historyRestoredPhoneRef.current = null;
       setIsAdminEligible(false);
     }
   }, [user, refreshAllData]);
@@ -1565,6 +1642,12 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             onClearHistory={async () => {
               await apiFetch('/api/calls', { method: 'DELETE' }).catch(() => {});
               setCalls([]);
+              if (user) {
+                const snap = loadLocalHistory(user.phoneE164);
+                snap.calls = [];
+                snap.homeFeed = snap.homeFeed.map((item) => ({ ...item, lastCall: null }));
+                saveLocalHistory(snap);
+              }
               refreshAllData();
             }}
             onCallback={startOutgoingCall}
@@ -1789,11 +1872,36 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           cleanupCallMedia();
           clearNativeSessionAuth();
           setAuthToken(null);
+          historyRestoredPhoneRef.current = null;
           setMeOpen(false);
+          setSubPage(null);
+          setActiveChatFriend(null);
           setUser(null);
           setHomeFeed([]);
           setFriendsList([]);
           setCalls([]);
+          setLiveMessages([]);
+          setNotifications([]);
+          setIncomingRequests([]);
+          setOutgoingRequests([]);
+        }}
+        onAccountDeleted={() => {
+          clearLocalHistory(user.phoneE164);
+          cleanupCallMedia();
+          clearNativeSessionAuth();
+          setAuthToken(null);
+          historyRestoredPhoneRef.current = null;
+          setMeOpen(false);
+          setSubPage(null);
+          setActiveChatFriend(null);
+          setUser(null);
+          setHomeFeed([]);
+          setFriendsList([]);
+          setCalls([]);
+          setLiveMessages([]);
+          setNotifications([]);
+          setIncomingRequests([]);
+          setOutgoingRequests([]);
         }}
       />
 

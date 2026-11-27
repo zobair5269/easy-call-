@@ -4,6 +4,11 @@ import { translate, type TranslationKeys } from '../i18n/translations';
 import { apiFetch, fileToCompressedDataUrl, resolveApiUrl } from '../lib/api';
 import type { ChatMessage, PublicUser, SelfUser } from '../types/app';
 import { Avatar } from './Avatar';
+import {
+  getLocalMessagesForPeer,
+  mergeThreadMessages,
+  saveLocalMessagesForPeer,
+} from '../lib/localHistory';
 import { formatLastSeen } from '../lib/formatLastSeen';
 import type { PhotoViewerTarget } from './PhotoViewerModal';
 
@@ -36,17 +41,26 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
   useEffect(() => {
     if (!friend) return;
     let active = true;
+    const cached = getLocalMessagesForPeer(selfUser.phoneE164, friend);
+    setMessages(cached);
+    setError(null);
+
     apiFetch<{ messages: ChatMessage[] }>(`/api/messages/${friend.id}`)
       .then((res) => {
-        if (active) setMessages(res.messages);
+        if (!active) return;
+        const merged = mergeThreadMessages(res.messages || [], cached);
+        setMessages(merged);
+        saveLocalMessagesForPeer(selfUser.phoneE164, selfUser.id, friend, merged);
       })
       .catch((err) => {
-        if (active) setError(err instanceof Error ? err.message : 'Unable to load chat.');
+        if (active && cached.length === 0) {
+          setError(err instanceof Error ? err.message : 'Unable to load chat.');
+        }
       });
     return () => {
       active = false;
     };
-  }, [friend]);
+  }, [friend, selfUser.id, selfUser.phoneE164]);
 
   useEffect(() => {
     if (!friend) return;
@@ -59,9 +73,12 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
     setMessages((prev) => {
       const ids = new Set(prev.map((p) => p.id));
       const added = relevant.filter((r) => !ids.has(r.id));
-      return added.length > 0 ? [...prev, ...added] : prev;
+      if (added.length === 0) return prev;
+      const next = [...prev, ...added];
+      saveLocalMessagesForPeer(selfUser.phoneE164, selfUser.id, friend, next);
+      return next;
     });
-  }, [incomingMessages, friend, selfUser.id]);
+  }, [incomingMessages, friend, selfUser.id, selfUser.phoneE164]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -80,7 +97,11 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
         method: 'POST',
         body: JSON.stringify({ body: trimmed }),
       });
-      setMessages((prev) => [...prev, res.message]);
+      setMessages((prev) => {
+        const next = [...prev, res.message];
+        saveLocalMessagesForPeer(selfUser.phoneE164, selfUser.id, friend, next);
+        return next;
+      });
       setText('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to send.');
@@ -104,7 +125,11 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
         method: 'POST',
         body: JSON.stringify({ body: '', imageId: uploaded.uploadId }),
       });
-      setMessages((prev) => [...prev, res.message]);
+      setMessages((prev) => {
+        const next = [...prev, res.message];
+        saveLocalMessagesForPeer(selfUser.phoneE164, selfUser.id, friend, next);
+        return next;
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to send photo.');
     } finally {

@@ -1419,6 +1419,191 @@ export function createApiRouter(): Router {
     res.json({ ok: true });
   });
 
+  router.get('/history/snapshot', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    const msgRows = db
+      .prepare(
+        `SELECT m.id, m.sender_id, m.receiver_id, m.body, m.image_id, m.status, m.created_at,
+                su.phone_e164 AS sender_phone, ru.phone_e164 AS receiver_phone
+         FROM messages m
+         INNER JOIN users su ON su.id = m.sender_id
+         INNER JOIN users ru ON ru.id = m.receiver_id
+         WHERE m.sender_id = ? OR m.receiver_id = ?
+         ORDER BY m.created_at DESC
+         LIMIT 600`
+      )
+      .all(user.id, user.id) as Array<{
+      id: string;
+      sender_id: string;
+      receiver_id: string;
+      body: string;
+      image_id: string | null;
+      status: string;
+      created_at: number;
+      sender_phone: string;
+      receiver_phone: string;
+    }>;
+
+    const threads: Record<string, { peerId: string; peerPhone: string; messages: Array<Record<string, unknown>> }> = {};
+    for (let i = msgRows.length - 1; i >= 0; i--) {
+      const m = msgRows[i];
+      const senderIsSelf = m.sender_id === user.id;
+      const peerId = senderIsSelf ? m.receiver_id : m.sender_id;
+      const peerPhone = senderIsSelf ? m.receiver_phone : m.sender_phone;
+      if (!peerId || !peerPhone || isBlockedBetween(user.id, peerId)) continue;
+      if (!threads[peerPhone]) {
+        threads[peerPhone] = { peerId, peerPhone, messages: [] };
+      }
+      threads[peerPhone].messages.push({
+        id: m.id,
+        senderId: m.sender_id,
+        receiverId: m.receiver_id,
+        body: m.body,
+        imageUrl: m.image_id ? `/api/uploads/${m.image_id}` : null,
+        status: m.status,
+        createdAt: m.created_at,
+      });
+    }
+
+    res.json({ threads });
+  });
+
+  router.post('/history/restore', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    const now = Date.now();
+    const rawPeers = Array.isArray(req.body?.peers) ? req.body.peers.slice(0, 200) : [];
+    const rawCalls = Array.isArray(req.body?.calls) ? req.body.calls.slice(0, 200) : [];
+    const rawMessages = Array.isArray(req.body?.messages) ? req.body.messages.slice(0, 500) : [];
+
+    const peerByPhone = new Map<string, UserRow>();
+    const selectByPhone = db.prepare('SELECT * FROM users WHERE phone_e164 = ?');
+    const insertStubPeer = db.prepare(
+      `INSERT OR IGNORE INTO users (id, phone_e164, country_iso, country_code, display_name, qr_token, created_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const insertSyncedContact = db.prepare(
+      `INSERT OR IGNORE INTO synced_contacts (owner_id, contact_user_id, created_at) VALUES (?, ?, ?)`
+    );
+
+    const resolveOrEnsurePeer = (rawPhone: string, displayName = '', countryIso = 'US'): UserRow | null => {
+      const phone = normalizePhoneE164(rawPhone);
+      if (!phone || phone === user.phone_e164) return null;
+      const cached = peerByPhone.get(phone);
+      if (cached) return cached;
+
+      let peer = selectByPhone.get(phone) as UserRow | undefined;
+      if (!peer) {
+        const peerId = crypto.randomUUID();
+        const qrToken = `EC-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+        const safeName = displayName.trim().slice(0, 60);
+        const safeIso = /^[A-Z]{2}$/.test(countryIso.toUpperCase()) ? countryIso.toUpperCase() : 'US';
+        insertStubPeer.run(peerId, phone, safeIso, user.country_code || '+1', safeName, qrToken, now, now);
+        peer = selectByPhone.get(phone) as UserRow | undefined;
+      }
+      if (!peer || isBlockedBetween(user.id, peer.id)) return null;
+      insertSyncedContact.run(user.id, peer.id, now);
+      peerByPhone.set(phone, peer);
+      return peer;
+    };
+
+    for (const p of rawPeers) {
+      if (!p || typeof p !== 'object') continue;
+      const phone = typeof p.phoneE164 === 'string' ? p.phoneE164 : '';
+      const name = typeof p.displayName === 'string' ? p.displayName : '';
+      const iso = typeof p.countryIso === 'string' ? p.countryIso : 'US';
+      resolveOrEnsurePeer(phone, name, iso);
+    }
+
+    let restoredCalls = 0;
+    const findExistingCall = db.prepare(
+      `SELECT 1 FROM call_records
+       WHERE id = ? OR (caller_id = ? AND callee_id = ? AND started_at = ?)`
+    );
+    const insertCall = db.prepare(
+      `INSERT OR IGNORE INTO call_records
+         (id, caller_id, callee_id, call_type, status, started_at, answered_at, ended_at, duration_sec, callee_seen)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
+    );
+
+    for (const c of rawCalls) {
+      if (!c || typeof c !== 'object') continue;
+      const peerPhone = typeof c.peerPhone === 'string' ? c.peerPhone : '';
+      const peerName = typeof c.peerName === 'string' ? c.peerName : '';
+      const peerIso = typeof c.peerCountryIso === 'string' ? c.peerCountryIso : 'US';
+      const peer = resolveOrEnsurePeer(peerPhone, peerName, peerIso);
+      if (!peer) continue;
+
+      const direction = c.direction === 'outgoing' ? 'outgoing' : 'incoming';
+      const callType = c.callType === 'video' ? 'video' : 'audio';
+      const allowedStatuses = new Set(['completed', 'missed', 'rejected', 'cancelled']);
+      const status = typeof c.status === 'string' && allowedStatuses.has(c.status) ? c.status : 'missed';
+      const startedAt = Number(c.startedAt);
+      if (!Number.isFinite(startedAt) || startedAt <= 0 || startedAt > now + 60_000) continue;
+      const endedAtRaw = Number(c.endedAt);
+      const endedAt = Number.isFinite(endedAtRaw) && endedAtRaw >= startedAt ? endedAtRaw : startedAt;
+      const durationSec = Math.max(0, Math.min(86400, Math.floor(Number(c.durationSec) || 0)));
+
+      const callerId = direction === 'outgoing' ? user.id : peer.id;
+      const calleeId = direction === 'outgoing' ? peer.id : user.id;
+      const callId =
+        typeof c.id === 'string' && c.id.length >= 8 && c.id.length <= 64
+          ? c.id
+          : crypto.randomUUID();
+
+      if (findExistingCall.get(callId, callerId, calleeId, startedAt)) continue;
+      const answeredAt = status === 'completed' ? startedAt : null;
+      insertCall.run(callId, callerId, calleeId, callType, status, startedAt, answeredAt, endedAt, durationSec);
+      restoredCalls += 1;
+    }
+
+    let restoredMessages = 0;
+    const findUpload = db.prepare('SELECT id FROM uploads WHERE id = ?');
+    const findExistingMsg = db.prepare(
+      `SELECT 1 FROM messages
+       WHERE id = ? OR (sender_id = ? AND receiver_id = ? AND created_at = ? AND body = ?)`
+    );
+    const insertMsg = db.prepare(
+      `INSERT OR IGNORE INTO messages (id, sender_id, receiver_id, body, image_id, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    for (const m of rawMessages) {
+      if (!m || typeof m !== 'object') continue;
+      const peerPhone = typeof m.peerPhone === 'string' ? m.peerPhone : '';
+      const peer = resolveOrEnsurePeer(peerPhone);
+      if (!peer) continue;
+
+      const senderIsSelf = Boolean(m.senderIsSelf);
+      const senderId = senderIsSelf ? user.id : peer.id;
+      const receiverId = senderIsSelf ? peer.id : user.id;
+      const createdAt = Number(m.createdAt);
+      if (!Number.isFinite(createdAt) || createdAt <= 0 || createdAt > now + 60_000) continue;
+
+      let body = typeof m.body === 'string' ? m.body.trim().slice(0, 2000) : '';
+      let imageId: string | null = null;
+      if (typeof m.imageUrl === 'string') {
+        const match = m.imageUrl.match(/\/api\/uploads\/([0-9a-f-]{36})$/i);
+        if (match && findUpload.get(match[1])) {
+          imageId = match[1];
+        }
+      }
+      if (!body && !imageId) {
+        body = '[Photo]';
+      }
+      const msgStatus = m.status === 'read' || m.status === 'delivered' ? m.status : 'sent';
+      const msgId =
+        typeof m.id === 'string' && m.id.length >= 8 && m.id.length <= 64
+          ? m.id
+          : crypto.randomUUID();
+
+      if (findExistingMsg.get(msgId, senderId, receiverId, createdAt, body)) continue;
+      insertMsg.run(msgId, senderId, receiverId, body, imageId, msgStatus, createdAt);
+      restoredMessages += 1;
+    }
+
+    res.json({ ok: true, restoredCalls, restoredMessages });
+  });
+
   router.get('/messages/:friendId', requireAuth, (req: AuthedRequest, res) => {
     const user = req.user!;
     const friendId = req.params.friendId;

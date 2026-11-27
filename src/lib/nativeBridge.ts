@@ -2,6 +2,9 @@ interface EasyCallNativeApi {
   setSessionAuth?: (serverUrl: string, token: string, userId: string) => void;
   getSessionAuth?: () => string;
   clearSessionAuth?: () => void;
+  saveHistorySnapshot?: (phoneKey: string, json: string) => void;
+  getHistorySnapshot?: (phoneKey: string) => string;
+  clearHistorySnapshot?: (phoneKey: string) => void;
   stopRinging?: () => void;
   setCallAudioMode?: (inCall: boolean, speakerOn: boolean) => void;
   setSpeakerphone?: (speakerOn: boolean) => void;
@@ -39,6 +42,30 @@ export function getNativeSessionAuth(): string {
 export function clearNativeSessionAuth(): void {
   try {
     window.EasyCallNative?.clearSessionAuth?.();
+  } catch {
+    // Ignore when running outside APK
+  }
+}
+
+export function saveNativeHistorySnapshot(phoneKey: string, json: string): void {
+  try {
+    window.EasyCallNative?.saveHistorySnapshot?.(phoneKey, json);
+  } catch {
+    // Ignore when running outside APK
+  }
+}
+
+export function getNativeHistorySnapshot(phoneKey: string): string {
+  try {
+    return window.EasyCallNative?.getHistorySnapshot?.(phoneKey) || '';
+  } catch {
+    return '';
+  }
+}
+
+export function clearNativeHistorySnapshot(phoneKey: string): void {
+  try {
+    window.EasyCallNative?.clearHistorySnapshot?.(phoneKey);
   } catch {
     // Ignore when running outside APK
   }

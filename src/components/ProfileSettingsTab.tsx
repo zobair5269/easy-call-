@@ -54,6 +54,7 @@ interface ProfileSettingsTabProps {
   onOpenNotifications: () => void;
   onOpenAdmin: () => void;
   onLoggedOut: () => void;
+  onAccountDeleted?: () => void;
   onPreviewPhoto: (target: PhotoViewerTarget) => void;
 }
 
@@ -74,6 +75,7 @@ export const ProfileSettingsTab: React.FC<ProfileSettingsTabProps> = ({
   onOpenNotifications,
   onOpenAdmin,
   onLoggedOut,
+  onAccountDeleted,
   onPreviewPhoto,
 }) => {
   const t = (key: TranslationKeys) => translate(language, key);
@@ -203,7 +205,7 @@ export const ProfileSettingsTab: React.FC<ProfileSettingsTabProps> = ({
     setSaving(true);
     try {
       await apiFetch('/api/users/me', { method: 'DELETE' });
-      onLoggedOut();
+      (onAccountDeleted || onLoggedOut)();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to delete account.');
       setSaving(false);
