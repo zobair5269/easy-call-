@@ -1,5 +1,6 @@
 interface EasyCallNativeApi {
   setSessionAuth?: (serverUrl: string, token: string, userId: string) => void;
+  getSessionAuth?: () => string;
   clearSessionAuth?: () => void;
   stopRinging?: () => void;
   setCallAudioMode?: (inCall: boolean, speakerOn: boolean) => void;
@@ -24,6 +25,14 @@ export function syncNativeSessionAuth(serverUrl: string, token: string, userId: 
     window.EasyCallNative?.setSessionAuth?.(serverUrl, token, userId);
   } catch {
     // Ignore when running outside APK
+  }
+}
+
+export function getNativeSessionAuth(): string {
+  try {
+    return window.EasyCallNative?.getSessionAuth?.()?.trim() || '';
+  } catch {
+    return '';
   }
 }
 

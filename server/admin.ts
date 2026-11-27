@@ -18,6 +18,7 @@ import {
   verifyPin,
   verifySameOriginIfCookie,
 } from './security.ts';
+import { resolveOrRestoreSessionUser } from './session.ts';
 
 const ROOT_DIR = process.cwd();
 const BUILDS_DIR = path.resolve(ROOT_DIR, 'data', 'builds');
@@ -167,18 +168,8 @@ function getAuthenticatedUserPhone(req: Request): string | null {
       : typeof cookieToken === 'string' && cookieToken
         ? cookieToken
         : null;
-  if (!rawToken) return null;
-
-  const row = db
-    .prepare(
-      `SELECT u.phone_e164
-       FROM sessions s
-       JOIN users u ON u.id = s.user_id
-       WHERE s.token_hash = ? AND s.expires_at > ?`
-    )
-    .get(hashWithServerSecret(rawToken), Date.now()) as { phone_e164: string } | undefined;
-
-  return row ? row.phone_e164 : null;
+  const resolved = resolveOrRestoreSessionUser(rawToken);
+  return resolved ? resolved.user.phone_e164 : null;
 }
 
 function createAdminSession(req: Request, res: Response): string {

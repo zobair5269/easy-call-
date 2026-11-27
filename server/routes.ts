@@ -14,14 +14,13 @@ import {
   type UserRow,
 } from './db.ts';
 import {
+  SESSION_TTL_MS,
   checkRateLimit,
   detectImageMimeFromMagicBytes,
   generateOtpCode,
-  generateSessionToken,
   getClientIp,
   hashOtp,
   hashPin,
-  hashWithServerSecret,
   normalizeContactCandidates,
   normalizePhoneE164,
   resolveSafeUploadPath,
@@ -29,6 +28,12 @@ import {
   verifyPin,
   verifySameOriginIfCookie,
 } from './security.ts';
+import {
+  createPersistentSession,
+  resolveOrRestoreSessionUser,
+  revokeAllSessionsForDeletedUser,
+  revokeSessionToken,
+} from './session.ts';
 import {
   acceptIncomingCallById,
   isUserOnline,
@@ -42,6 +47,7 @@ import {
 interface AuthedRequest extends Request {
   user?: UserRow;
   usedCookieAuth?: boolean;
+  authToken?: string;
 }
 
 const COUNTRY_DIAL_MAP: Record<string, { iso: string; code: string; name: string }> = {
@@ -121,7 +127,8 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
   }
 
   if (!token) {
-    res.status(401).json({ error: 'Authentication required' });
+    res.setHeader('X-EasyCall-Session', 'invalid');
+    res.status(401).json({ error: 'Authentication required', sessionInvalid: true });
     return;
   }
 
@@ -134,28 +141,26 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
     return;
   }
 
-  const tokenHash = hashWithServerSecret(token);
   const now = Date.now();
-  const session = db
-    .prepare('SELECT user_id, expires_at FROM sessions WHERE token_hash = ? AND expires_at > ?')
-    .get(tokenHash, now) as { user_id: string; expires_at: number } | undefined;
+  const resolved = resolveOrRestoreSessionUser(
+    token,
+    String(req.headers['user-agent'] || '').slice(0, 200)
+  );
 
-  if (!session) {
-    res.status(401).json({ error: 'Session expired or invalid' });
+  if (!resolved) {
+    res.setHeader('X-EasyCall-Session', 'invalid');
+    res.status(401).json({ error: 'Session expired or invalid', sessionInvalid: true });
     return;
   }
 
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(session.user_id) as
-    | UserRow
-    | undefined;
-  if (!user) {
-    res.status(401).json({ error: 'Account not found' });
-    return;
-  }
-
+  const user = resolved.user;
   db.prepare('UPDATE users SET last_seen_at = ? WHERE id = ?').run(now, user.id);
+  if (usedCookie || req.path === '/users/me') {
+    setSessionCookie(req, res, token, SESSION_TTL_MS);
+  }
   req.user = user;
   req.usedCookieAuth = usedCookie;
+  req.authToken = token;
   next();
 }
 
@@ -370,13 +375,10 @@ export function createApiRouter(): Router {
       user = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id) as unknown as UserRow;
     }
 
-    const rawToken = generateSessionToken();
-    const tokenHash = hashWithServerSecret(rawToken);
-    const maxAgeMs = 30 * 24 * 60 * 60 * 1000;
-    db.prepare(
-      `INSERT INTO sessions (token_hash, user_id, expires_at, created_at, user_agent)
-       VALUES (?, ?, ?, ?, ?)`
-    ).run(tokenHash, user.id, now + maxAgeMs, now, String(req.headers['user-agent'] || '').slice(0, 200));
+    const { rawToken } = createPersistentSession(
+      user,
+      String(req.headers['user-agent'] || '').slice(0, 200)
+    );
 
     if (!isNewUser) {
       db.prepare(
@@ -385,7 +387,7 @@ export function createApiRouter(): Router {
       ).run(crypto.randomUUID(), user.id, now);
     }
 
-    setSessionCookie(req, res, rawToken, maxAgeMs);
+    setSessionCookie(req, res, rawToken, SESSION_TTL_MS);
     res.json({
       token: rawToken,
       isNewUser,
@@ -417,20 +419,17 @@ export function createApiRouter(): Router {
     }
 
     const now = Date.now();
-    const rawToken = generateSessionToken();
-    const tokenHash = hashWithServerSecret(rawToken);
-    const maxAgeMs = 30 * 24 * 60 * 60 * 1000;
-    db.prepare(
-      `INSERT INTO sessions (token_hash, user_id, expires_at, created_at, user_agent)
-       VALUES (?, ?, ?, ?, ?)`
-    ).run(tokenHash, user.id, now + maxAgeMs, now, String(req.headers['user-agent'] || '').slice(0, 200));
+    const { rawToken } = createPersistentSession(
+      user,
+      String(req.headers['user-agent'] || '').slice(0, 200)
+    );
 
     db.prepare(
       `INSERT INTO notifications (id, user_id, type, title, body, created_at)
        VALUES (?, ?, 'security', 'Account recovered via PIN', 'Your account was accessed using your Recovery PIN.', ?)`
     ).run(crypto.randomUUID(), user.id, now);
 
-    setSessionCookie(req, res, rawToken, maxAgeMs);
+    setSessionCookie(req, res, rawToken, SESSION_TTL_MS);
     res.json({
       token: rawToken,
       user: getFullSelfView(user),
@@ -445,14 +444,14 @@ export function createApiRouter(): Router {
         : req.cookies?.easycall_sid;
 
     if (token) {
-      db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashWithServerSecret(token));
+      revokeSessionToken(token);
     }
     clearSessionCookie(req, res);
     res.json({ ok: true });
   });
 
   router.get('/users/me', requireAuth, (req: AuthedRequest, res) => {
-    res.json({ user: getFullSelfView(req.user!) });
+    res.json({ user: getFullSelfView(req.user!), token: req.authToken });
   });
 
   router.patch('/users/me', requireAuth, (req: AuthedRequest, res) => {
@@ -530,6 +529,7 @@ export function createApiRouter(): Router {
       }
     }
 
+    revokeAllSessionsForDeletedUser(user.id);
     db.prepare('DELETE FROM users WHERE id = ?').run(user.id);
     clearSessionCookie(req, res);
     res.json({ ok: true });

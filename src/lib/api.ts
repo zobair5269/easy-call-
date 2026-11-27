@@ -1,7 +1,20 @@
+import { getNativeSessionAuth, hasNativeAndroidBridge } from './nativeBridge';
+
 const APK_TOKEN_STORAGE_KEY = 'easycall_apk_token';
 let inMemoryToken: string | null = null;
 let apkConfigServerUrl = '';
 let apkConfigLoaded = false;
+
+export class ApiRequestError extends Error {
+  status: number;
+  sessionInvalid: boolean;
+
+  constructor(message: string, status: number, sessionInvalid = false) {
+    super(message);
+    this.status = status;
+    this.sessionInvalid = sessionInvalid;
+  }
+}
 
 export function isNativeApkOrigin(): boolean {
   return typeof window !== 'undefined' && window.location.hostname === 'easycall.app';
@@ -34,15 +47,26 @@ export function setConfiguredServerUrl(url: string): void {
 }
 
 export async function initApiConfig(): Promise<void> {
-  if (!isNativeApkOrigin()) return;
-  if (!inMemoryToken) {
-    try {
-      const saved = window.localStorage.getItem(APK_TOKEN_STORAGE_KEY);
-      if (saved) inMemoryToken = saved;
-    } catch {
-      // Ignore storage access errors
+  const isApk = isNativeApkOrigin() || hasNativeAndroidBridge();
+  if (isApk && !inMemoryToken) {
+    const nativeTok = getNativeSessionAuth();
+    if (nativeTok) {
+      inMemoryToken = nativeTok;
+      try {
+        window.localStorage.setItem(APK_TOKEN_STORAGE_KEY, nativeTok);
+      } catch {
+        // Ignore storage access errors
+      }
+    } else {
+      try {
+        const saved = window.localStorage.getItem(APK_TOKEN_STORAGE_KEY);
+        if (saved) inMemoryToken = saved;
+      } catch {
+        // Ignore storage access errors
+      }
     }
   }
+  if (!isNativeApkOrigin()) return;
   if (apkConfigLoaded) return;
   apkConfigLoaded = true;
   try {
@@ -60,7 +84,7 @@ export async function initApiConfig(): Promise<void> {
 
 export function setAuthToken(token: string | null) {
   inMemoryToken = token;
-  if (isNativeApkOrigin()) {
+  if (isNativeApkOrigin() || hasNativeAndroidBridge()) {
     try {
       if (token) {
         window.localStorage.setItem(APK_TOKEN_STORAGE_KEY, token);
@@ -85,14 +109,15 @@ export function resolveApiUrl(path: string): string {
 
 export async function apiFetch<T>(
   path: string,
-  options: RequestInit = {}
+  options: RequestInit & { maxRetries?: number } = {}
 ): Promise<T> {
   if (isNativeApkOrigin() && !apkConfigLoaded) {
     await initApiConfig();
   }
 
-  const headers = new Headers(options.headers || {});
-  if (!headers.has('Content-Type') && options.body && typeof options.body === 'string') {
+  const { maxRetries = 1, ...fetchOptions } = options;
+  const headers = new Headers(fetchOptions.headers || {});
+  if (!headers.has('Content-Type') && fetchOptions.body && typeof fetchOptions.body === 'string') {
     headers.set('Content-Type', 'application/json');
   }
   headers.set('X-Requested-With', 'EasyCallClient');
@@ -103,24 +128,31 @@ export async function apiFetch<T>(
   const targetUrl = resolveApiUrl(path);
   let res: Response | null = null;
   let lastNetworkError = false;
+  const totalAttempts = Math.max(1, maxRetries + 1);
 
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < totalAttempts; attempt++) {
     try {
       res = await fetch(targetUrl, {
-        ...options,
+        ...fetchOptions,
         headers,
         credentials: 'include',
       });
-      if (attempt === 0 && (res.status === 502 || res.status === 503 || res.status === 504)) {
-        await new Promise((r) => setTimeout(r, 2500));
+      if (
+        attempt < totalAttempts - 1 &&
+        (res.status === 502 || res.status === 503 || res.status === 504)
+      ) {
+        await new Promise((r) => setTimeout(r, Math.min(6000, 1800 * (attempt + 1))));
         continue;
       }
       lastNetworkError = false;
       break;
     } catch {
       lastNetworkError = true;
-      if (attempt === 0 && isNativeApkOrigin() && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
-        await new Promise((r) => setTimeout(r, 2000));
+      if (
+        attempt < totalAttempts - 1 &&
+        (typeof navigator === 'undefined' || navigator.onLine !== false)
+      ) {
+        await new Promise((r) => setTimeout(r, Math.min(6000, 1800 * (attempt + 1))));
         continue;
       }
       break;
@@ -129,17 +161,28 @@ export async function apiFetch<T>(
 
   if (lastNetworkError || !res) {
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-      throw new Error('No internet connection on this device.');
+      throw new ApiRequestError('No internet connection on this device.', 0, false);
     }
     if (isNativeApkOrigin()) {
-      throw new Error('Server is waking up or unreachable. Wait 15 seconds and tap again.');
+      throw new ApiRequestError(
+        'Server is waking up or unreachable. Wait 15 seconds and tap again.',
+        0,
+        false
+      );
     }
-    throw new Error('Unable to reach EASY CALL server. Please try again.');
+    throw new ApiRequestError('Unable to reach EASY CALL server. Please try again.', 0, false);
   }
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    if (res.status === 401) {
+    const isSessionInvalid =
+      res.status === 401 &&
+      (data?.sessionInvalid === true ||
+        res.headers.get('X-EasyCall-Session') === 'invalid' ||
+        (typeof data?.error === 'string' &&
+          /session|authentication|account not found/i.test(data.error)));
+
+    if (isSessionInvalid) {
       setAuthToken(null);
     }
     const message =
@@ -150,7 +193,7 @@ export async function apiFetch<T>(
           : res.status >= 502 && res.status <= 504
             ? 'Server is starting up. Please wait a few seconds and try again.'
             : `Request failed (${res.status})`;
-    throw new Error(message);
+    throw new ApiRequestError(message, res.status, isSessionInvalid);
   }
   return data as T;
 }

@@ -62,8 +62,106 @@ export function verifyPin(pin: string, stored: string): boolean {
   return crypto.timingSafeEqual(actualBuf, expectedBuf);
 }
 
+export const SESSION_TTL_MS = 180 * 24 * 60 * 60 * 1000;
+
+export interface SignedSessionPayload {
+  uid: string;
+  ph: string;
+  ci: string;
+  cc: string;
+  dn: string;
+  lg: string;
+  qt: string;
+  iat: number;
+  exp: number;
+  jti: string;
+}
+
 export function generateSessionToken(): string {
   return crypto.randomBytes(32).toString('base64url');
+}
+
+export function createSignedSessionToken(
+  user: {
+    id: string;
+    phone_e164: string;
+    country_iso: string;
+    country_code: string;
+    display_name: string;
+    language: string;
+    qr_token: string;
+  },
+  ttlMs = SESSION_TTL_MS
+): string {
+  const now = Date.now();
+  const payload: SignedSessionPayload = {
+    uid: user.id,
+    ph: user.phone_e164,
+    ci: (user.country_iso || 'US').slice(0, 4),
+    cc: (user.country_code || '+1').slice(0, 8),
+    dn: (user.display_name || '').slice(0, 60),
+    lg: (user.language || 'en').slice(0, 8),
+    qt: user.qr_token,
+    iat: now,
+    exp: now + ttlMs,
+    jti: crypto.randomBytes(16).toString('base64url'),
+  };
+  const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const signingInput = `ec1.${payloadB64}`;
+  const sigB64 = crypto
+    .createHmac('sha256', SERVER_SECRET)
+    .update(signingInput)
+    .digest('base64url');
+  return `${signingInput}.${sigB64}`;
+}
+
+export function verifySignedSessionToken(rawToken: string): SignedSessionPayload | null {
+  if (!rawToken || !rawToken.startsWith('ec1.')) return null;
+  const parts = rawToken.split('.');
+  if (parts.length !== 3) return null;
+  const [, payloadB64, sigB64] = parts;
+  if (!payloadB64 || !sigB64) return null;
+
+  try {
+    const signingInput = `ec1.${payloadB64}`;
+    const expectedSig = crypto.createHmac('sha256', SERVER_SECRET).update(signingInput).digest();
+    const actualSig = Buffer.from(sigB64, 'base64url');
+    if (actualSig.length !== expectedSig.length || !crypto.timingSafeEqual(actualSig, expectedSig)) {
+      return null;
+    }
+
+    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as Partial<SignedSessionPayload>;
+    if (
+      typeof parsed.uid !== 'string' ||
+      !parsed.uid ||
+      typeof parsed.ph !== 'string' ||
+      typeof parsed.qt !== 'string' ||
+      !parsed.qt ||
+      typeof parsed.jti !== 'string' ||
+      !parsed.jti ||
+      typeof parsed.exp !== 'number' ||
+      parsed.exp <= Date.now()
+    ) {
+      return null;
+    }
+    const normalizedPhone = normalizePhoneE164(parsed.ph);
+    if (!normalizedPhone) return null;
+
+    return {
+      uid: parsed.uid,
+      ph: normalizedPhone,
+      ci: typeof parsed.ci === 'string' ? parsed.ci.slice(0, 4) : 'US',
+      cc: typeof parsed.cc === 'string' ? parsed.cc.slice(0, 8) : '+1',
+      dn: typeof parsed.dn === 'string' ? parsed.dn.slice(0, 60) : '',
+      lg: typeof parsed.lg === 'string' ? parsed.lg.slice(0, 8) : 'en',
+      qt: parsed.qt,
+      iat: typeof parsed.iat === 'number' ? parsed.iat : Date.now(),
+      exp: parsed.exp,
+      jti: parsed.jti,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function generateOtpCode(): string {

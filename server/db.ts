@@ -178,6 +178,17 @@ db.exec(`
     created_at INTEGER NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS revoked_tokens (
+    token_hash TEXT PRIMARY KEY,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS deleted_users (
+    user_id TEXT PRIMARY KEY,
+    deleted_at INTEGER NOT NULL
+  );
+
   CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_challenges(phone_e164);
   CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
   CREATE INDEX IF NOT EXISTS idx_fr_to ON friend_requests(to_user_id, status);

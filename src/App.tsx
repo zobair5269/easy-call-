@@ -25,7 +25,7 @@ import { ProfileSettingsTab } from './components/ProfileSettingsTab';
 import { QrModal } from './components/QrModal';
 import { WelcomeAuth } from './components/WelcomeAuth';
 import { detectDeviceLanguage, getLanguageMeta, translate, type TranslationKeys } from './i18n/translations';
-import { apiFetch, buildWsUrl, getAuthToken, initApiConfig, resolveApiUrl, setAuthToken } from './lib/api';
+import { ApiRequestError, apiFetch, buildWsUrl, getAuthToken, initApiConfig, resolveApiUrl, setAuthToken } from './lib/api';
 import {
   clearNativeSessionAuth,
   consumeNativePendingAcceptCallId,
@@ -86,6 +86,7 @@ export default function App() {
 
 function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const [booting, setBooting] = useState(true);
+  const [sessionReconnectError, setSessionReconnectError] = useState<string | null>(null);
   const [user, setUser] = useState<SelfUser | null>(null);
   const [isAdminEligible, setIsAdminEligible] = useState(false);
   const [language, setLanguage] = useState<string>(() => detectDeviceLanguage());
@@ -233,26 +234,64 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     return () => clearInterval(timer);
   }, [callSession]);
 
-  // Load ICE servers & attempt session restore via HttpOnly cookie
-  useEffect(() => {
-    initApiConfig().finally(() => {
-      apiFetch<{ iceServers: RTCIceServer[] }>('/api/rtc-config')
-        .then((res) => {
-          if (Array.isArray(res.iceServers) && res.iceServers.length > 0) {
-            iceServersRef.current = res.iceServers;
-          }
-        })
-        .catch(() => {});
+  const restoreSession = useCallback(async () => {
+    setSessionReconnectError(null);
+    await initApiConfig();
+    apiFetch<{ iceServers: RTCIceServer[] }>('/api/rtc-config')
+      .then((res) => {
+        if (Array.isArray(res.iceServers) && res.iceServers.length > 0) {
+          iceServersRef.current = res.iceServers;
+        }
+      })
+      .catch(() => {});
 
-      apiFetch<{ user: SelfUser }>('/api/users/me')
-        .then((res) => {
-          setUser(res.user);
-          setLanguage(res.user.language || detectDeviceLanguage());
-        })
-        .catch(() => {})
-        .finally(() => setBooting(false));
-    });
+    try {
+      const res = await apiFetch<{ user: SelfUser; token?: string }>('/api/users/me', {
+        maxRetries: 4,
+      });
+      if (res.token) {
+        setAuthToken(res.token);
+      }
+      setSessionReconnectError(null);
+      setUser(res.user);
+      setLanguage(res.user.language || detectDeviceLanguage());
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.sessionInvalid) {
+        clearNativeSessionAuth();
+        setAuthToken(null);
+        setSessionReconnectError(null);
+      } else if (getAuthToken()) {
+        setSessionReconnectError(
+          err instanceof Error ? err.message : 'Unable to reach EASY CALL server.'
+        );
+      }
+    } finally {
+      setBooting(false);
+    }
   }, []);
+
+  // Load ICE servers & attempt persistent session restore on launch
+  useEffect(() => {
+    void restoreSession();
+  }, [restoreSession]);
+
+  // If launch hit a temporary network / cold-start timeout while token is saved, auto-retry on resume
+  useEffect(() => {
+    if (user || !sessionReconnectError) return;
+    const retry = () => {
+      if (getAuthToken()) {
+        void restoreSession();
+      }
+    };
+    window.addEventListener('online', retry);
+    window.addEventListener('easycall:resume', retry);
+    window.addEventListener('focus', retry);
+    return () => {
+      window.removeEventListener('online', retry);
+      window.removeEventListener('easycall:resume', retry);
+      window.removeEventListener('focus', retry);
+    };
+  }, [user, sessionReconnectError, restoreSession]);
 
   const refreshAllData = useCallback(async () => {
     if (!user) return;
@@ -306,7 +345,10 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   useEffect(() => {
     if (user) {
       refreshAllData();
-      syncNativeSessionAuth(resolveApiUrl(''), getAuthToken() || '', user.id);
+      const activeTok = getAuthToken();
+      if (activeTok) {
+        syncNativeSessionAuth(resolveApiUrl(''), activeTok, user.id);
+      }
       setNativeRingtone(getSelectedRingtoneId());
       if (hasNativeAndroidBridge() && contactsSyncedUserIdRef.current !== user.id) {
         const nums = getNativeDeviceContacts();
@@ -1347,6 +1389,47 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
     );
   }
 
+  if (!user && sessionReconnectError && getAuthToken()) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-white dark:bg-slate-950 px-6">
+        <div className="w-full max-w-sm rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 text-center shadow-lg">
+          <img
+            src="/easycall-logo.png"
+            alt="EASY CALL"
+            className="mx-auto h-14 w-14 rounded-full object-cover shadow"
+          />
+          <h2 className="mt-4 font-display text-lg font-bold text-slate-900 dark:text-white">
+            EASY CALL
+          </h2>
+          <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
+            {sessionReconnectError}
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              setBooting(true);
+              void restoreSession();
+            }}
+            className="mt-5 w-full min-h-[44px] rounded-xl bg-[#1D8BF1] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#1979D2]"
+          >
+            Reconnect Account
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              clearNativeSessionAuth();
+              setAuthToken(null);
+              setSessionReconnectError(null);
+            }}
+            className="mt-2.5 w-full min-h-[40px] rounded-xl px-4 py-2 text-xs font-medium text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
+          >
+            Switch Account / Sign Out
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (!user) {
     return (
       <WelcomeAuth
@@ -1356,6 +1439,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         onToggleDarkMode={() => setDarkMode((d) => !d)}
         onAuthenticated={(u, tok) => {
           setAuthToken(tok);
+          setSessionReconnectError(null);
           setUser(u);
           if (u.language) setLanguage(u.language);
         }}

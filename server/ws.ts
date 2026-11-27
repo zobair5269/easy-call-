@@ -6,7 +6,7 @@ import {
   getPublicUserView,
   type UserRow,
 } from './db.ts';
-import { hashWithServerSecret } from './security.ts';
+import { resolveOrRestoreSessionUser } from './session.ts';
 
 const userSockets = new Map<string, Set<WebSocket>>();
 const backgroundStreams = new Map<string, Set<ServerResponse>>();
@@ -158,13 +158,8 @@ function broadcastPresenceToFriends(userId: string, online: boolean) {
 }
 
 function authenticateToken(rawToken: string | null): string | null {
-  if (!rawToken) return null;
-  const tokenHash = hashWithServerSecret(rawToken);
-  const now = Date.now();
-  const row = db
-    .prepare('SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?')
-    .get(tokenHash, now) as { user_id: string } | undefined;
-  return row ? row.user_id : null;
+  const resolved = resolveOrRestoreSessionUser(rawToken);
+  return resolved ? resolved.user.id : null;
 }
 
 function parseCookieToken(cookieHeader: string | undefined): string | null {

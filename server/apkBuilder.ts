@@ -645,10 +645,14 @@ public class EasyCallService extends Service {
 
                 int code = conn.getResponseCode();
                 if (code == 401) {
-                    prefs.edit().remove("authToken").apply();
-                    running = false;
-                    stopSelf();
-                    return;
+                    String sessionHeader = conn.getHeaderField("X-EasyCall-Session");
+                    if ("invalid".equalsIgnoreCase(sessionHeader)) {
+                        prefs.edit().remove("authToken").apply();
+                        running = false;
+                        stopSelf();
+                        return;
+                    }
+                    throw new RuntimeException("Transient HTTP 401");
                 }
                 if (code != 200) {
                     throw new RuntimeException("HTTP " + code);
@@ -1778,6 +1782,21 @@ public class MainActivity extends Activity {
             } catch (Throwable ignored) {
             }
 
+            try {
+                SharedPreferences savedPrefs = getSharedPreferences(EasyCallService.PREFS_NAME, MODE_PRIVATE);
+                String savedToken = savedPrefs.getString("authToken", "");
+                if (savedToken != null && !savedToken.trim().isEmpty()) {
+                    Intent svc = new Intent(MainActivity.this, EasyCallService.class);
+                    svc.setAction(EasyCallService.ACTION_START);
+                    if (Build.VERSION.SDK_INT >= 26) {
+                        startForegroundService(svc);
+                    } else {
+                        startService(svc);
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+
             requestRuntimePermissions();
             webView.loadUrl(APP_ORIGIN);
         } catch (Throwable fatal) {
@@ -1847,13 +1866,20 @@ public class MainActivity extends Activity {
         public void setSessionAuth(final String serverUrl, final String token, final String userId) {
             try {
                 SharedPreferences prefs = getSharedPreferences(EasyCallService.PREFS_NAME, MODE_PRIVATE);
-                prefs.edit()
-                    .putString("serverUrl", serverUrl != null ? serverUrl.trim() : "")
-                    .putString("authToken", token != null ? token.trim() : "")
-                    .putString("userId", userId != null ? userId.trim() : "")
-                    .apply();
-
+                SharedPreferences.Editor editor = prefs.edit();
+                if (serverUrl != null && !serverUrl.trim().isEmpty()) {
+                    editor.putString("serverUrl", serverUrl.trim());
+                }
                 if (token != null && !token.trim().isEmpty()) {
+                    editor.putString("authToken", token.trim());
+                }
+                if (userId != null && !userId.trim().isEmpty()) {
+                    editor.putString("userId", userId.trim());
+                }
+                editor.apply();
+
+                String activeToken = prefs.getString("authToken", "");
+                if (activeToken != null && !activeToken.trim().isEmpty()) {
                     EasyCallService.ensurePhoneAccount(MainActivity.this);
                     Intent svc = new Intent(MainActivity.this, EasyCallService.class);
                     svc.setAction(EasyCallService.ACTION_START);
@@ -1864,6 +1890,17 @@ public class MainActivity extends Activity {
                     }
                 }
             } catch (Throwable ignored) {
+            }
+        }
+
+        @JavascriptInterface
+        public String getSessionAuth() {
+            try {
+                SharedPreferences prefs = getSharedPreferences(EasyCallService.PREFS_NAME, MODE_PRIVATE);
+                String tok = prefs.getString("authToken", "");
+                return tok != null ? tok : "";
+            } catch (Throwable ignored) {
+                return "";
             }
         }
 
