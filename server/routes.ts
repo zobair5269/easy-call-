@@ -17,6 +17,7 @@ import {
   SESSION_TTL_MS,
   checkRateLimit,
   detectImageMimeFromMagicBytes,
+  detectVideoMimeFromMagicBytes,
   generateOtpCode,
   getClientIp,
   hashOtp,
@@ -543,7 +544,12 @@ export function createApiRouter(): Router {
     }
 
     const dataUrl = typeof req.body?.dataUrl === 'string' ? req.body.dataUrl : '';
-    const purpose = req.body?.purpose === 'chat' ? 'chat' : 'avatar';
+    const purpose =
+      req.body?.purpose === 'chat'
+        ? 'chat'
+        : req.body?.purpose === 'story'
+          ? 'story'
+          : 'avatar';
     const match = dataUrl.match(/^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
     if (!match) {
       res.status(400).json({ error: 'Only JPEG, PNG, or WebP images are permitted.' });
@@ -596,6 +602,53 @@ export function createApiRouter(): Router {
     });
   });
 
+  router.post(
+    '/uploads/story-video',
+    requireAuth,
+    express.raw({
+      type: ['video/mp4', 'video/webm', 'video/quicktime', 'application/octet-stream'],
+      limit: '25mb',
+    }),
+    (req: AuthedRequest, res) => {
+      const user = req.user!;
+      if (!checkRateLimit(`upload-video:${user.id}`, 10, 10 * 60_000)) {
+        res.status(429).json({ error: 'Video upload rate limit reached.' });
+        return;
+      }
+
+      const buffer = Buffer.isBuffer(req.body) ? req.body : null;
+      if (!buffer || buffer.length === 0 || buffer.length > 25 * 1024 * 1024) {
+        res.status(400).json({ error: 'Video must be non-empty and under 25 MB.' });
+        return;
+      }
+
+      const detected = detectVideoMimeFromMagicBytes(buffer);
+      if (!detected) {
+        res.status(400).json({ error: 'Only MP4, MOV, or WebM videos are permitted.' });
+        return;
+      }
+
+      const uploadId = crypto.randomUUID();
+      const fileName = `${uploadId}.${detected.ext}`;
+      const safePath = resolveSafeUploadPath(fileName);
+      if (!safePath) {
+        res.status(500).json({ error: 'Storage path validation failed.' });
+        return;
+      }
+
+      fs.writeFileSync(safePath, buffer);
+      db.prepare(
+        `INSERT INTO uploads (id, owner_id, mime_type, file_name, size_bytes, purpose, created_at)
+         VALUES (?, ?, ?, ?, ?, 'story_video', ?)`
+      ).run(uploadId, user.id, detected.mime, fileName, buffer.length, Date.now());
+
+      res.json({
+        uploadId,
+        url: `/api/uploads/${uploadId}`,
+      });
+    }
+  );
+
   router.delete('/users/me/avatar', requireAuth, (req: AuthedRequest, res) => {
     const user = req.user!;
     if (user.avatar_id) {
@@ -631,9 +684,27 @@ export function createApiRouter(): Router {
       res.status(404).end();
       return;
     }
+    const stat = fs.statSync(safePath);
+    const total = stat.size;
     res.setHeader('Content-Type', row.mime_type);
     res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'private, max-age=3600');
+
+    const rangeHeader = req.headers.range;
+    if (typeof rangeHeader === 'string' && rangeHeader.startsWith('bytes=') && total > 0) {
+      const parts = rangeHeader.replace(/^bytes=/, '').split('-');
+      const start = Math.max(0, parseInt(parts[0] || '0', 10) || 0);
+      const end = parts[1] ? Math.min(total - 1, parseInt(parts[1], 10)) : total - 1;
+      if (start <= end && start < total) {
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+        res.setHeader('Content-Length', String(end - start + 1));
+        fs.createReadStream(safePath, { start, end }).pipe(res);
+        return;
+      }
+    }
+    res.setHeader('Content-Length', String(total));
     fs.createReadStream(safePath).pipe(res);
   });
 
@@ -1847,6 +1918,316 @@ export function createApiRouter(): Router {
     const user = req.user!;
     const declined = rejectIncomingCallById(req.params.id, user.id);
     res.json({ ok: true, declined });
+  });
+
+  const getStoryConnectedIds = (uid: string): Set<string> => {
+    const connected = new Set<string>();
+    const fRows = db
+      .prepare(
+        `SELECT CASE WHEN user_a = ? THEN user_b ELSE user_a END AS peer_id
+         FROM friendships WHERE user_a = ? OR user_b = ?`
+      )
+      .all(uid, uid, uid) as Array<{ peer_id: string }>;
+    for (const r of fRows) {
+      if (r.peer_id && r.peer_id !== uid && !isBlockedBetween(uid, r.peer_id)) {
+        connected.add(r.peer_id);
+      }
+    }
+    const sRows = db
+      .prepare(
+        `SELECT contact_user_id AS peer_id FROM synced_contacts WHERE owner_id = ?
+         UNION
+         SELECT owner_id AS peer_id FROM synced_contacts WHERE contact_user_id = ?`
+      )
+      .all(uid, uid) as Array<{ peer_id: string }>;
+    for (const r of sRows) {
+      if (r.peer_id && r.peer_id !== uid && !isBlockedBetween(uid, r.peer_id)) {
+        connected.add(r.peer_id);
+      }
+    }
+    return connected;
+  };
+
+  router.get('/stories', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    const now = Date.now();
+    const directIds = getStoryConnectedIds(user.id);
+    const fofIds = new Set<string>();
+    for (const fid of directIds) {
+      for (const candidate of getStoryConnectedIds(fid)) {
+        if (
+          candidate !== user.id &&
+          !directIds.has(candidate) &&
+          !isBlockedBetween(user.id, candidate)
+        ) {
+          fofIds.add(candidate);
+        }
+      }
+    }
+
+    const rows = db
+      .prepare(
+        `SELECT s.id AS story_id, s.author_id, s.media_type, s.text_content, s.bg_style,
+                s.media_upload_id, s.duration_sec, s.visibility,
+                s.created_at AS story_created_at, s.expires_at,
+                u.*,
+                EXISTS(SELECT 1 FROM story_views sv WHERE sv.story_id = s.id AND sv.viewer_id = ?) AS viewed_by_me,
+                (SELECT COUNT(*) FROM story_views sv WHERE sv.story_id = s.id AND sv.viewer_id != s.author_id) AS view_count
+         FROM stories s
+         INNER JOIN users u ON u.id = s.author_id
+         WHERE s.expires_at > ?
+         ORDER BY s.created_at ASC`
+      )
+      .all(user.id, now) as unknown as Array<
+      {
+        story_id: string;
+        author_id: string;
+        media_type: 'text' | 'image' | 'video';
+        text_content: string;
+        bg_style: string;
+        media_upload_id: string | null;
+        duration_sec: number;
+        visibility: 'friends' | 'friends_of_friends';
+        story_created_at: number;
+        expires_at: number;
+        viewed_by_me: number;
+        view_count: number;
+      } & UserRow
+    >;
+
+    const myStories: Array<Record<string, unknown>> = [];
+    const groupMap = new Map<
+      string,
+      {
+        author: Record<string, unknown>;
+        relation: 'friend' | 'friend_of_friend';
+        hasUnviewed: boolean;
+        latestCreatedAt: number;
+        stories: Array<Record<string, unknown>>;
+      }
+    >();
+
+    for (const r of rows) {
+      const isSelf = r.author_id === user.id;
+      const isDirect = directIds.has(r.author_id);
+      const isFof = fofIds.has(r.author_id);
+
+      if (!isSelf) {
+        if (isBlockedBetween(user.id, r.author_id)) continue;
+        if (!isDirect && !(r.visibility === 'friends_of_friends' && isFof)) continue;
+      }
+
+      const item = {
+        id: r.story_id,
+        authorId: r.author_id,
+        mediaType: r.media_type,
+        textContent: r.text_content,
+        bgStyle: r.bg_style,
+        mediaUrl: r.media_upload_id ? `/api/uploads/${r.media_upload_id}` : null,
+        durationSec: r.duration_sec,
+        visibility: r.visibility,
+        createdAt: r.story_created_at,
+        expiresAt: r.expires_at,
+        viewedByMe: Boolean(r.viewed_by_me),
+        viewCount: isSelf ? Number(r.view_count) || 0 : undefined,
+      };
+
+      if (isSelf) {
+        myStories.push(item);
+      } else {
+        let grp = groupMap.get(r.author_id);
+        if (!grp) {
+          grp = {
+            author: {
+              ...getPublicUserView(r, isDirect),
+              lastSeenAt: r.show_online_status ? r.last_seen_at : 0,
+              online: r.show_online_status ? isUserOnline(r.author_id) : false,
+              showOnlineStatus: Boolean(r.show_online_status),
+            },
+            relation: isDirect ? 'friend' : 'friend_of_friend',
+            hasUnviewed: false,
+            latestCreatedAt: r.story_created_at,
+            stories: [],
+          };
+          groupMap.set(r.author_id, grp);
+        }
+        if (!item.viewedByMe) grp.hasUnviewed = true;
+        if (r.story_created_at > grp.latestCreatedAt) grp.latestCreatedAt = r.story_created_at;
+        grp.stories.push(item);
+      }
+    }
+
+    const groups = Array.from(groupMap.values()).sort((a, b) => {
+      if (a.hasUnviewed !== b.hasUnviewed) return a.hasUnviewed ? -1 : 1;
+      return b.latestCreatedAt - a.latestCreatedAt;
+    });
+
+    res.json({ myStories, groups });
+  });
+
+  router.post('/stories', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    if (!checkRateLimit(`story-create:${user.id}`, 30, 60 * 60_000)) {
+      res.status(429).json({ error: 'Story post rate limit reached.' });
+      return;
+    }
+
+    const mediaType =
+      req.body?.mediaType === 'image' || req.body?.mediaType === 'video'
+        ? req.body.mediaType
+        : 'text';
+    const visibility =
+      req.body?.visibility === 'friends_of_friends' ? 'friends_of_friends' : 'friends';
+    const textContent =
+      typeof req.body?.textContent === 'string' ? req.body.textContent.trim().slice(0, 500) : '';
+    const rawBg = typeof req.body?.bgStyle === 'string' ? req.body.bgStyle.trim() : '#1D8BF1';
+    const bgStyle = /^#[0-9a-fA-F]{6}$/.test(rawBg) ? rawBg : '#1D8BF1';
+    const uploadId =
+      typeof req.body?.uploadId === 'string' && /^[0-9a-f-]{36}$/i.test(req.body.uploadId)
+        ? req.body.uploadId
+        : null;
+    const durationSec = Math.max(0, Math.min(30, Math.round(Number(req.body?.durationSec) || 0)));
+
+    if (mediaType === 'text' && !textContent) {
+      res.status(400).json({ error: 'Please write something for your text story.' });
+      return;
+    }
+
+    if ((mediaType === 'image' || mediaType === 'video') && !uploadId) {
+      res.status(400).json({ error: 'Story photo or video upload is required.' });
+      return;
+    }
+
+    if (mediaType === 'video' && Number(req.body?.durationSec) > 30.9) {
+      res.status(400).json({ error: 'Story video cannot be longer than 30 seconds.' });
+      return;
+    }
+
+    if (uploadId) {
+      const up = db
+        .prepare('SELECT id FROM uploads WHERE id = ? AND owner_id = ?')
+        .get(uploadId, user.id);
+      if (!up) {
+        res.status(400).json({ error: 'Uploaded story media not found.' });
+        return;
+      }
+    }
+
+    const now = Date.now();
+    const expiresAt = now + 24 * 60 * 60 * 1000;
+    const storyId = crypto.randomUUID();
+    db.prepare(
+      `INSERT INTO stories (id, author_id, media_type, text_content, bg_style, media_upload_id, duration_sec, visibility, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      storyId,
+      user.id,
+      mediaType,
+      textContent,
+      bgStyle,
+      uploadId,
+      mediaType === 'video' ? durationSec || 30 : 5,
+      visibility,
+      now,
+      expiresAt
+    );
+
+    const directIds = getStoryConnectedIds(user.id);
+    const notifyIds = new Set<string>(directIds);
+    if (visibility === 'friends_of_friends') {
+      for (const fid of directIds) {
+        for (const fof of getStoryConnectedIds(fid)) {
+          if (fof !== user.id && !isBlockedBetween(user.id, fof)) {
+            notifyIds.add(fof);
+          }
+        }
+      }
+    }
+    for (const targetId of notifyIds) {
+      sendToUser(targetId, { type: 'stories:refresh' });
+    }
+
+    res.json({
+      story: {
+        id: storyId,
+        authorId: user.id,
+        mediaType,
+        textContent,
+        bgStyle,
+        mediaUrl: uploadId ? `/api/uploads/${uploadId}` : null,
+        durationSec: mediaType === 'video' ? durationSec || 30 : 5,
+        visibility,
+        createdAt: now,
+        expiresAt,
+        viewedByMe: true,
+        viewCount: 0,
+      },
+    });
+  });
+
+  router.post('/stories/:id/view', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    const story = db
+      .prepare('SELECT id, author_id, visibility, expires_at FROM stories WHERE id = ?')
+      .get(req.params.id) as
+      | { id: string; author_id: string; visibility: string; expires_at: number }
+      | undefined;
+
+    if (!story || story.expires_at <= Date.now()) {
+      res.status(404).json({ error: 'Story not found.' });
+      return;
+    }
+
+    if (story.author_id !== user.id) {
+      if (isBlockedBetween(user.id, story.author_id)) {
+        res.status(403).json({ error: 'Not allowed.' });
+        return;
+      }
+      const directIds = getStoryConnectedIds(user.id);
+      let allowed = directIds.has(story.author_id);
+      if (!allowed && story.visibility === 'friends_of_friends') {
+        for (const fid of directIds) {
+          if (getStoryConnectedIds(fid).has(story.author_id)) {
+            allowed = true;
+            break;
+          }
+        }
+      }
+      if (!allowed) {
+        res.status(403).json({ error: 'Not allowed to view this story.' });
+        return;
+      }
+    }
+
+    db.prepare(
+      `INSERT OR IGNORE INTO story_views (story_id, viewer_id, viewed_at) VALUES (?, ?, ?)`
+    ).run(story.id, user.id, Date.now());
+    res.json({ ok: true });
+  });
+
+  router.delete('/stories/:id', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    const story = db
+      .prepare('SELECT id, media_upload_id FROM stories WHERE id = ? AND author_id = ?')
+      .get(req.params.id, user.id) as { id: string; media_upload_id: string | null } | undefined;
+
+    if (!story) {
+      res.status(404).json({ error: 'Story not found.' });
+      return;
+    }
+
+    db.prepare('DELETE FROM stories WHERE id = ?').run(story.id);
+    if (story.media_upload_id) {
+      const up = db
+        .prepare('SELECT file_name FROM uploads WHERE id = ? AND owner_id = ?')
+        .get(story.media_upload_id, user.id) as { file_name: string } | undefined;
+      if (up) {
+        const safePath = resolveSafeUploadPath(up.file_name);
+        if (safePath && fs.existsSync(safePath)) fs.unlinkSync(safePath);
+        db.prepare('DELETE FROM uploads WHERE id = ?').run(story.media_upload_id);
+      }
+    }
+    res.json({ ok: true });
   });
 
   return router;

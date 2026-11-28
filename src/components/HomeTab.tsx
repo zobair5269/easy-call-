@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Camera,
   Check,
   Loader2,
   Phone,
@@ -7,7 +8,6 @@ import {
   PhoneMissed,
   PhoneOutgoing,
   Plus,
-  QrCode,
   Search,
   UserPlus,
   Video,
@@ -21,6 +21,8 @@ import type {
   HomeFeedItem,
   PublicUser,
   SelfUser,
+  StoryAuthorGroup,
+  StoryItem,
 } from '../types/app';
 import { Avatar } from './Avatar';
 import { formatLastSeen } from '../lib/formatLastSeen';
@@ -33,13 +35,15 @@ interface HomeTabProps {
   recentCalls: CallRecordItem[];
   friendsList: PublicUser[];
   incomingRequests?: FriendRequestItem[];
+  myStories: StoryItem[];
+  storyGroups: StoryAuthorGroup[];
   searchOpen: boolean;
   onCloseSearch: () => void;
   onRespondFriendRequest?: (requestId: string, action: 'accept' | 'reject') => Promise<void> | void;
   onStartCall: (peer: PublicUser, callType: 'audio' | 'video') => void;
   onOpenChat: (peer: PublicUser) => void;
-  onOpenQrScanner: () => void;
-  onOpenMe: () => void;
+  onOpenStoryCreator: () => void;
+  onOpenStoryViewer: (target: 'self' | string) => void;
   onPreviewPhoto: (target: PhotoViewerTarget) => void;
 }
 
@@ -72,13 +76,15 @@ export const HomeTab: React.FC<HomeTabProps> = ({
   recentCalls,
   friendsList,
   incomingRequests = [],
+  myStories,
+  storyGroups,
   searchOpen,
   onCloseSearch,
   onRespondFriendRequest,
   onStartCall,
   onOpenChat,
-  onOpenQrScanner,
-  onOpenMe,
+  onOpenStoryCreator,
+  onOpenStoryViewer,
   onPreviewPhoto,
 }) => {
   const t = (key: TranslationKeys) => translate(language, key);
@@ -140,6 +146,9 @@ export const HomeTab: React.FC<HomeTabProps> = ({
   // Quick-access contact strip combining feed peers (with unread badges) and connected friends
   const quickStripPeers = useMemo(() => {
     const seen = new Set<string>([selfUser.id]);
+    for (const grp of storyGroups) {
+      seen.add(grp.author.id);
+    }
     const list: Array<{ peer: PublicUser; unreadCount: number }> = [];
     for (const item of homeFeed) {
       if (!seen.has(item.peer.id)) {
@@ -154,7 +163,7 @@ export const HomeTab: React.FC<HomeTabProps> = ({
       }
     }
     return list.slice(0, 14);
-  }, [homeFeed, friendsList, selfUser.id]);
+  }, [homeFeed, friendsList, storyGroups, selfUser.id]);
 
   return (
     <div className="bg-white dark:bg-slate-900 min-h-[calc(100vh-116px)]">
@@ -335,43 +344,90 @@ export const HomeTab: React.FC<HomeTabProps> = ({
         </div>
       ) : (
         <>
-          {/* Screenshot 3 Horizontal Quick Strip */}
+          {/* Top Horizontal Story & Active Circles Strip */}
           <div className="flex items-start gap-4 overflow-x-auto px-4 py-3 border-b border-slate-100 dark:border-slate-800/80 no-scrollbar">
-            {/* Scan QR / Add Contact Tile */}
+            {/* Add Story Tile */}
             <button
               type="button"
-              onClick={onOpenQrScanner}
+              onClick={onOpenStoryCreator}
               className="flex flex-col items-center gap-1.5 w-[62px] shrink-0 group"
             >
-              <div className="relative flex h-[50px] w-[50px] items-center justify-center rounded-full bg-[#F2F4F7] dark:bg-slate-800 text-slate-800 dark:text-slate-100 group-active:scale-95 transition-transform">
-                <QrCode className="h-6 w-6" />
+              <div className="relative flex h-[50px] w-[50px] items-center justify-center rounded-full bg-[#F2F4F7] dark:bg-slate-800 text-slate-900 dark:text-slate-100 group-active:scale-95 transition-transform">
+                <Camera className="h-6 w-6 fill-slate-900 dark:fill-slate-100" />
                 <span className="absolute -bottom-0.5 -end-0.5 flex h-5 w-5 items-center justify-center rounded-full bg-[#1D8BF1] text-white border-2 border-white dark:border-slate-900">
                   <Plus className="h-3 w-3 stroke-[3]" />
                 </span>
               </div>
               <span className="text-[11.5px] text-slate-600 dark:text-slate-300 truncate w-full text-center">
-                {t('scanQrCode')}
+                Story
               </span>
             </button>
 
-            {/* Self Profile Tile */}
+            {/* My Story Tile */}
             <button
               type="button"
-              onClick={onOpenMe}
+              onClick={() => {
+                if (myStories.length > 0) {
+                  onOpenStoryViewer('self');
+                } else {
+                  onOpenStoryCreator();
+                }
+              }}
               className="flex flex-col items-center gap-1.5 w-[62px] shrink-0 group"
             >
-              <div className="relative">
+              <div
+                className={`relative rounded-full ${
+                  myStories.length > 0
+                    ? 'p-[2px] ring-2 ring-[#22C55E] ring-offset-1 dark:ring-offset-slate-900'
+                    : ''
+                }`}
+              >
                 <Avatar
                   src={selfUser.avatarUrl}
                   name={selfUser.displayName || selfUser.phoneE164}
                   size="md"
-                  online={true}
+                  online={myStories.length === 0 ? true : undefined}
                 />
+                {myStories.length > 0 && (
+                  <span className="absolute -top-0.5 -end-0.5 flex h-5 min-w-[20px] items-center justify-center rounded-full bg-[#22C55E] px-1 text-[11px] font-bold text-white border-2 border-white dark:border-slate-900">
+                    {myStories.length}
+                  </span>
+                )}
               </div>
               <span className="text-[11.5px] text-slate-600 dark:text-slate-300 truncate w-full text-center">
-                {selfUser.displayName?.split(' ')[0] || 'You'}
+                My Story
               </span>
             </button>
+
+            {/* Friend & Friends-of-Friends Story Circles */}
+            {storyGroups.map((group) => (
+              <button
+                key={`story-${group.author.id}`}
+                type="button"
+                onClick={() => onOpenStoryViewer(group.author.id)}
+                className="flex flex-col items-center gap-1.5 w-[62px] shrink-0 group"
+              >
+                <div
+                  className={`relative rounded-full ${
+                    group.hasUnviewed
+                      ? 'p-[2px] ring-2 ring-[#22C55E] ring-offset-1 dark:ring-offset-slate-900'
+                      : 'p-[2px] ring-2 ring-slate-300 dark:ring-slate-600 ring-offset-1 dark:ring-offset-slate-900'
+                  }`}
+                >
+                  <Avatar
+                    src={group.author.avatarUrl}
+                    name={group.author.displayName || group.author.phoneE164 || 'User'}
+                    size="md"
+                  />
+                  <span className="absolute -top-0.5 -end-0.5 flex h-5 min-w-[20px] items-center justify-center rounded-full bg-[#22C55E] px-1 text-[11px] font-bold text-white border-2 border-white dark:border-slate-900">
+                    {group.stories.length}
+                  </span>
+                </div>
+                <span className="text-[11.5px] text-slate-600 dark:text-slate-300 truncate w-full text-center">
+                  {group.author.displayName || group.author.phoneE164}
+                </span>
+              </button>
+            ))}
 
             {/* Connected Contacts / Recent Active Circles */}
             {quickStripPeers.map(({ peer, unreadCount }) => (

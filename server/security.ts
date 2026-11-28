@@ -241,6 +241,23 @@ export function detectImageMimeFromMagicBytes(buf: Buffer): { mime: string; ext:
   return null;
 }
 
+export function detectVideoMimeFromMagicBytes(buf: Buffer): { mime: string; ext: string } | null {
+  if (buf.length < 12) return null;
+  // ISO BMFF (MP4 / MOV / 3GP): ....ftyp
+  if (buf.subarray(4, 8).toString('ascii') === 'ftyp') {
+    const brand = buf.subarray(8, 12).toString('ascii');
+    if (brand === 'qt  ') {
+      return { mime: 'video/quicktime', ext: 'mov' };
+    }
+    return { mime: 'video/mp4', ext: 'mp4' };
+  }
+  // WebM / Matroska EBML header: 1A 45 DF A3
+  if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) {
+    return { mime: 'video/webm', ext: 'webm' };
+  }
+  return null;
+}
+
 export function resolveSafeUploadPath(fileName: string): string | null {
   const safeBase = path.basename(fileName);
   const resolved = path.resolve(UPLOAD_DIR, safeBase);

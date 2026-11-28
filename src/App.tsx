@@ -23,6 +23,8 @@ import { NotificationsDrawer } from './components/NotificationsDrawer';
 import { PhotoViewerModal, type PhotoViewerTarget } from './components/PhotoViewerModal';
 import { ProfileSettingsTab } from './components/ProfileSettingsTab';
 import { QrModal } from './components/QrModal';
+import { StoryCreatorModal } from './components/StoryCreatorModal';
+import { StoryViewerModal } from './components/StoryViewerModal';
 import { WelcomeAuth } from './components/WelcomeAuth';
 import { detectDeviceLanguage, getLanguageMeta, translate, type TranslationKeys } from './i18n/translations';
 import { ApiRequestError, apiFetch, buildWsUrl, getAuthToken, initApiConfig, resolveApiUrl, setAuthToken } from './lib/api';
@@ -39,13 +41,16 @@ import {
 } from './lib/nativeBridge';
 import {
   buildHistoryRestorePayload,
+  clearCachedSelfProfile,
   clearLocalHistory,
+  loadCachedSelfProfile,
   loadLocalHistory,
   mergeCalls,
   mergeFriends,
   mergeHomeFeed,
   mergeThreadMessages,
   migrateSelfUserId,
+  saveCachedSelfProfile,
   saveLocalHistory,
   type StoredThread,
 } from './lib/localHistory';
@@ -60,6 +65,8 @@ import type {
   HomeFeedItem,
   PublicUser,
   SelfUser,
+  StoryAuthorGroup,
+  StoryItem,
 } from './types/app';
 
 export default function App() {
@@ -97,11 +104,14 @@ export default function App() {
 }
 
 function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
-  const [booting, setBooting] = useState(true);
+  const [booting, setBooting] = useState(() => !loadCachedSelfProfile());
   const [sessionReconnectError, setSessionReconnectError] = useState<string | null>(null);
-  const [user, setUser] = useState<SelfUser | null>(null);
+  const [user, setUser] = useState<SelfUser | null>(() => loadCachedSelfProfile());
   const [isAdminEligible, setIsAdminEligible] = useState(false);
-  const [language, setLanguage] = useState<string>(() => detectDeviceLanguage());
+  const [language, setLanguage] = useState<string>(() => {
+    const cached = loadCachedSelfProfile();
+    return cached?.language || detectDeviceLanguage();
+  });
   const [darkMode, setDarkMode] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
     return window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false;
@@ -113,15 +123,28 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [quickMenuOpen, setQuickMenuOpen] = useState(false);
 
-  const [homeFeed, setHomeFeed] = useState<HomeFeedItem[]>([]);
-  const [friendsList, setFriendsList] = useState<PublicUser[]>([]);
-  const [calls, setCalls] = useState<CallRecordItem[]>([]);
+  const [homeFeed, setHomeFeed] = useState<HomeFeedItem[]>(() => {
+    const cached = loadCachedSelfProfile();
+    return cached ? loadLocalHistory(cached.phoneE164).homeFeed : [];
+  });
+  const [friendsList, setFriendsList] = useState<PublicUser[]>(() => {
+    const cached = loadCachedSelfProfile();
+    return cached ? loadLocalHistory(cached.phoneE164).friendsList : [];
+  });
+  const [calls, setCalls] = useState<CallRecordItem[]>(() => {
+    const cached = loadCachedSelfProfile();
+    return cached ? loadLocalHistory(cached.phoneE164).calls : [];
+  });
+  const [myStories, setMyStories] = useState<StoryItem[]>([]);
+  const [storyGroups, setStoryGroups] = useState<StoryAuthorGroup[]>([]);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [incomingRequests, setIncomingRequests] = useState<FriendRequestItem[]>([]);
   const [outgoingRequests, setOutgoingRequests] = useState<FriendRequestItem[]>([]);
 
   const [qrOpen, setQrOpen] = useState(false);
   const [qrInitialTab, setQrInitialTab] = useState<'my' | 'scan'>('my');
+  const [storyCreatorOpen, setStoryCreatorOpen] = useState(false);
+  const [storyViewerTarget, setStoryViewerTarget] = useState<'self' | string | null>(null);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [activeChatFriend, setActiveChatFriend] = useState<PublicUser | null>(null);
   const [photoPreview, setPhotoPreview] = useState<PhotoViewerTarget | null>(null);
@@ -259,21 +282,26 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       .catch(() => {});
 
     try {
+      const hasCached = Boolean(loadCachedSelfProfile());
       const res = await apiFetch<{ user: SelfUser; token?: string }>('/api/users/me', {
-        maxRetries: 4,
+        maxRetries: hasCached ? 1 : 2,
+        timeoutMs: 8000,
       });
       if (res.token) {
         setAuthToken(res.token);
       }
+      saveCachedSelfProfile(res.user);
       setSessionReconnectError(null);
       setUser(res.user);
       setLanguage(res.user.language || detectDeviceLanguage());
     } catch (err) {
       if (err instanceof ApiRequestError && err.sessionInvalid) {
+        clearCachedSelfProfile();
         clearNativeSessionAuth();
         setAuthToken(null);
+        setUser(null);
         setSessionReconnectError(null);
-      } else if (getAuthToken()) {
+      } else if (!loadCachedSelfProfile() && getAuthToken()) {
         setSessionReconnectError(
           err instanceof Error ? err.message : 'Unable to reach EASY CALL server.'
         );
@@ -309,7 +337,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
   const refreshAllData = useCallback(async () => {
     if (!user) return;
     try {
-      const [feedRes, friendsRes, callRes, notifRes, reqRes, snapRes] = await Promise.all([
+      const [feedRes, friendsRes, callRes, notifRes, reqRes, snapRes, storiesRes] = await Promise.all([
         apiFetch<{ items: HomeFeedItem[] }>('/api/home-feed'),
         apiFetch<{ friends: PublicUser[] }>('/api/friends'),
         apiFetch<{ calls: CallRecordItem[] }>('/api/calls'),
@@ -317,6 +345,10 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         apiFetch<{ incoming: FriendRequestItem[]; outgoing?: FriendRequestItem[] }>('/api/friend-requests'),
         apiFetch<{ threads: Record<string, StoredThread> }>('/api/history/snapshot').catch(() => ({
           threads: {} as Record<string, StoredThread>,
+        })),
+        apiFetch<{ myStories: StoryItem[]; groups: StoryAuthorGroup[] }>('/api/stories').catch(() => ({
+          myStories: [] as StoryItem[],
+          groups: [] as StoryAuthorGroup[],
         })),
       ]);
 
@@ -341,6 +373,8 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       setHomeFeed(mergedFeed);
       setFriendsList(mergedFriends);
       setCalls(mergedCalls);
+      setMyStories(storiesRes.myStories || []);
+      setStoryGroups(storiesRes.groups || []);
       setNotifications(notifRes.notifications || []);
       setIncomingRequests(reqRes.incoming || []);
       setOutgoingRequests(reqRes.outgoing || []);
@@ -389,56 +423,64 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
 
   useEffect(() => {
     if (user) {
+      saveCachedSelfProfile(user);
       const localSnap = migrateSelfUserId(loadLocalHistory(user.phoneE164), user.id);
       if (localSnap.homeFeed.length > 0) setHomeFeed(localSnap.homeFeed);
       if (localSnap.friendsList.length > 0) setFriendsList(localSnap.friendsList);
       if (localSnap.calls.length > 0) setCalls(localSnap.calls);
 
-      const syncAndRestore = async () => {
-        if (historyRestoredPhoneRef.current !== user.phoneE164) {
-          historyRestoredPhoneRef.current = user.phoneE164;
-          const hasLocalData =
-            localSnap.calls.length > 0 ||
-            Object.keys(localSnap.threads).length > 0 ||
-            localSnap.friendsList.length > 0 ||
-            localSnap.homeFeed.length > 0;
-          if (hasLocalData) {
-            const payload = buildHistoryRestorePayload(localSnap, user.id);
-            if (
-              payload.calls.length > 0 ||
-              payload.messages.length > 0 ||
-              payload.peers.length > 0
-            ) {
-              await apiFetch('/api/history/restore', {
-                method: 'POST',
-                body: JSON.stringify(payload),
-              }).catch(() => {});
-            }
+      // Fetch live data immediately without blocking UI on backup restore
+      void refreshAllData();
+
+      if (historyRestoredPhoneRef.current !== user.phoneE164) {
+        historyRestoredPhoneRef.current = user.phoneE164;
+        const hasLocalData =
+          localSnap.calls.length > 0 ||
+          Object.keys(localSnap.threads).length > 0 ||
+          localSnap.friendsList.length > 0 ||
+          localSnap.homeFeed.length > 0;
+        if (hasLocalData) {
+          const payload = buildHistoryRestorePayload(localSnap, user.id);
+          if (
+            payload.calls.length > 0 ||
+            payload.messages.length > 0 ||
+            payload.peers.length > 0
+          ) {
+            apiFetch<{ restoredCalls?: number; restoredMessages?: number }>('/api/history/restore', {
+              method: 'POST',
+              body: JSON.stringify(payload),
+            })
+              .then((res) => {
+                if ((res?.restoredCalls || 0) + (res?.restoredMessages || 0) > 0) {
+                  void refreshAllData();
+                }
+              })
+              .catch(() => {});
           }
         }
-        await refreshAllData();
-      };
-
-      void syncAndRestore();
+      }
 
       const activeTok = getAuthToken();
       if (activeTok) {
         syncNativeSessionAuth(resolveApiUrl(''), activeTok, user.id);
       }
       setNativeRingtone(getSelectedRingtoneId());
+      let contactsTimer: number | null = null;
       if (hasNativeAndroidBridge() && contactsSyncedUserIdRef.current !== user.id) {
-        const nums = getNativeDeviceContacts();
-        if (nums.length > 0) {
-          contactsSyncedUserIdRef.current = user.id;
-          apiFetch('/api/contacts/match', {
-            method: 'POST',
-            body: JSON.stringify({ numbers: nums }),
-          })
-            .then(() => refreshAllData())
-            .catch(() => {
-              contactsSyncedUserIdRef.current = null;
-            });
-        }
+        contactsTimer = window.setTimeout(() => {
+          const nums = getNativeDeviceContacts();
+          if (nums.length > 0) {
+            contactsSyncedUserIdRef.current = user.id;
+            apiFetch('/api/contacts/match', {
+              method: 'POST',
+              body: JSON.stringify({ numbers: nums }),
+            })
+              .then(() => refreshAllData())
+              .catch(() => {
+                contactsSyncedUserIdRef.current = null;
+              });
+          }
+        }, 700);
       }
       const tok = getAuthToken();
       fetch(resolveApiUrl('/api/admin/status'), {
@@ -452,6 +494,10 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           }
         })
         .catch(() => {});
+
+      return () => {
+        if (contactsTimer !== null) window.clearTimeout(contactsTimer);
+      };
     } else {
       contactsSyncedUserIdRef.current = null;
       historyRestoredPhoneRef.current = null;
@@ -984,7 +1030,8 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           msg.type === 'friend_request:accepted' ||
           msg.type === 'friends:refresh' ||
           msg.type === 'notifications:refresh' ||
-          msg.type === 'calls:refresh'
+          msg.type === 'calls:refresh' ||
+          msg.type === 'stories:refresh'
         ) {
           refreshAllData();
         } else if (msg.type === 'chat:message' && msg.message) {
@@ -1494,6 +1541,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           <button
             type="button"
             onClick={() => {
+              clearCachedSelfProfile();
               clearNativeSessionAuth();
               setAuthToken(null);
               setSessionReconnectError(null);
@@ -1516,6 +1564,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         onToggleDarkMode={() => setDarkMode((d) => !d)}
         onAuthenticated={(u, tok) => {
           setAuthToken(tok);
+          saveCachedSelfProfile(u);
           setSessionReconnectError(null);
           setUser(u);
           if (u.language) setLanguage(u.language);
@@ -1699,16 +1748,15 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
             recentCalls={calls}
             friendsList={friendsList}
             incomingRequests={incomingRequests}
+            myStories={myStories}
+            storyGroups={storyGroups}
             searchOpen={searchOpen}
             onCloseSearch={() => setSearchOpen(false)}
             onRespondFriendRequest={respondFriendRequest}
             onStartCall={startOutgoingCall}
             onOpenChat={openChatWithPeer}
-            onOpenQrScanner={() => {
-              setQrInitialTab('scan');
-              setQrOpen(true);
-            }}
-            onOpenMe={() => setMeOpen(true)}
+            onOpenStoryCreator={() => setStoryCreatorOpen(true)}
+            onOpenStoryViewer={(target) => setStoryViewerTarget(target)}
             onPreviewPhoto={setPhotoPreview}
           />
         )}
@@ -1854,6 +1902,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         onClose={() => setMeOpen(false)}
         onToggleDarkMode={() => setDarkMode((d) => !d)}
         onUserUpdated={(updated) => {
+          saveCachedSelfProfile(updated);
           setUser(updated);
           if (updated.language) setLanguage(updated.language);
         }}
@@ -1869,6 +1918,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         onOpenAdmin={onOpenAdmin}
         onPreviewPhoto={setPhotoPreview}
         onLoggedOut={() => {
+          clearCachedSelfProfile();
           cleanupCallMedia();
           clearNativeSessionAuth();
           setAuthToken(null);
@@ -1876,6 +1926,10 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           setMeOpen(false);
           setSubPage(null);
           setActiveChatFriend(null);
+          setStoryCreatorOpen(false);
+          setStoryViewerTarget(null);
+          setMyStories([]);
+          setStoryGroups([]);
           setUser(null);
           setHomeFeed([]);
           setFriendsList([]);
@@ -1886,6 +1940,7 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           setOutgoingRequests([]);
         }}
         onAccountDeleted={() => {
+          clearCachedSelfProfile();
           clearLocalHistory(user.phoneE164);
           cleanupCallMedia();
           clearNativeSessionAuth();
@@ -1894,6 +1949,10 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
           setMeOpen(false);
           setSubPage(null);
           setActiveChatFriend(null);
+          setStoryCreatorOpen(false);
+          setStoryViewerTarget(null);
+          setMyStories([]);
+          setStoryGroups([]);
           setUser(null);
           setHomeFeed([]);
           setFriendsList([]);
@@ -1906,6 +1965,22 @@ function MainEasyCallApp({ onOpenAdmin }: { onOpenAdmin: () => void }) {
       />
 
       {/* Modals & Overlays */}
+      <StoryCreatorModal
+        open={storyCreatorOpen}
+        onClose={() => setStoryCreatorOpen(false)}
+        onCreated={refreshAllData}
+      />
+
+      <StoryViewerModal
+        target={storyViewerTarget}
+        selfUser={user}
+        myStories={myStories}
+        storyGroups={storyGroups}
+        onClose={() => setStoryViewerTarget(null)}
+        onAddMoreStory={() => setStoryCreatorOpen(true)}
+        onRefreshStories={refreshAllData}
+      />
+
       <QrModal
         open={qrOpen}
         initialTab={qrInitialTab}

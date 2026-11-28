@@ -1,4 +1,4 @@
-import type { CallRecordItem, ChatMessage, HomeFeedItem, PublicUser } from '../types/app';
+import type { CallRecordItem, ChatMessage, HomeFeedItem, PublicUser, SelfUser } from '../types/app';
 import {
   clearNativeHistorySnapshot,
   getNativeHistorySnapshot,
@@ -6,6 +6,37 @@ import {
 } from './nativeBridge';
 
 const STORAGE_PREFIX = 'easycall_history_v1:';
+const SELF_PROFILE_KEY = 'easycall_self_profile_v1';
+
+export function loadCachedSelfProfile(): SelfUser | null {
+  try {
+    const raw = window.localStorage.getItem(SELF_PROFILE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<SelfUser>;
+    if (typeof parsed?.id === 'string' && typeof parsed?.phoneE164 === 'string' && parsed.id && parsed.phoneE164) {
+      return parsed as SelfUser;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveCachedSelfProfile(user: SelfUser): void {
+  try {
+    window.localStorage.setItem(SELF_PROFILE_KEY, JSON.stringify(user));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function clearCachedSelfProfile(): void {
+  try {
+    window.localStorage.removeItem(SELF_PROFILE_KEY);
+  } catch {
+    // Ignore storage errors
+  }
+}
 
 export interface StoredThread {
   peerId: string;

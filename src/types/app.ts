@@ -96,4 +96,31 @@ export interface HomeFeedItem {
   missedCount?: number;
 }
 
+export type StoryVisibility = 'friends' | 'friends_of_friends';
+export type StoryMediaType = 'text' | 'image' | 'video';
+
+export interface StoryItem {
+  id: string;
+  authorId: string;
+  mediaType: StoryMediaType;
+  textContent: string;
+  bgStyle: string;
+  mediaUrl: string | null;
+  durationSec: number;
+  visibility: StoryVisibility;
+  createdAt: number;
+  expiresAt: number;
+  viewedByMe: boolean;
+  viewCount?: number;
+}
+
+export interface StoryAuthorGroup {
+  author: PublicUser;
+  relation: 'friend' | 'friend_of_friend';
+  hasUnviewed: boolean;
+  latestCreatedAt: number;
+  stories: StoryItem[];
+}
+
 export type ActiveTab = 'home' | 'calls' | 'contacts' | 'settings';
+

@@ -189,6 +189,29 @@ db.exec(`
     deleted_at INTEGER NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS stories (
+    id TEXT PRIMARY KEY,
+    author_id TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    text_content TEXT NOT NULL DEFAULT '',
+    bg_style TEXT NOT NULL DEFAULT '#1D8BF1',
+    media_upload_id TEXT,
+    duration_sec INTEGER NOT NULL DEFAULT 0,
+    visibility TEXT NOT NULL DEFAULT 'friends',
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS story_views (
+    story_id TEXT NOT NULL,
+    viewer_id TEXT NOT NULL,
+    viewed_at INTEGER NOT NULL,
+    PRIMARY KEY (story_id, viewer_id),
+    FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE,
+    FOREIGN KEY (viewer_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
   CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_challenges(phone_e164);
   CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
   CREATE INDEX IF NOT EXISTS idx_fr_to ON friend_requests(to_user_id, status);
@@ -197,6 +220,7 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_calls_callee ON call_records(callee_id, started_at DESC);
   CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages(sender_id, receiver_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_stories_author_exp ON stories(author_id, expires_at DESC);
 `);
 
 try {

@@ -109,13 +109,13 @@ export function resolveApiUrl(path: string): string {
 
 export async function apiFetch<T>(
   path: string,
-  options: RequestInit & { maxRetries?: number } = {}
+  options: RequestInit & { maxRetries?: number; timeoutMs?: number } = {}
 ): Promise<T> {
   if (isNativeApkOrigin() && !apkConfigLoaded) {
     await initApiConfig();
   }
 
-  const { maxRetries = 1, ...fetchOptions } = options;
+  const { maxRetries = 1, timeoutMs, ...fetchOptions } = options;
   const headers = new Headers(fetchOptions.headers || {});
   if (!headers.has('Content-Type') && fetchOptions.body && typeof fetchOptions.body === 'string') {
     headers.set('Content-Type', 'application/json');
@@ -131,12 +131,19 @@ export async function apiFetch<T>(
   const totalAttempts = Math.max(1, maxRetries + 1);
 
   for (let attempt = 0; attempt < totalAttempts; attempt++) {
+    const controller = timeoutMs && typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timeoutId =
+      controller && timeoutMs
+        ? window.setTimeout(() => controller.abort(), timeoutMs)
+        : null;
     try {
       res = await fetch(targetUrl, {
         ...fetchOptions,
         headers,
         credentials: 'include',
+        signal: controller ? controller.signal : fetchOptions.signal,
       });
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
       if (
         attempt < totalAttempts - 1 &&
         (res.status === 502 || res.status === 503 || res.status === 504)
@@ -147,6 +154,7 @@ export async function apiFetch<T>(
       lastNetworkError = false;
       break;
     } catch {
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
       lastNetworkError = true;
       if (
         attempt < totalAttempts - 1 &&
